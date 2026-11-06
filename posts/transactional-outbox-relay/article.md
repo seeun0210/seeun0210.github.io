@@ -55,9 +55,24 @@ public ConfirmedPaymentResult recordResult(VerifiedPgResult pgResult) {
 
 이제 결제 결과와 Outbox INSERT가 함께 커밋되거나 함께 롤백됩니다. Relay는 DB에 남은 PENDING을 다시 찾을 수 있습니다. Outbox를 별도 `REQUIRES_NEW`로 저장하거나 AFTER_COMMIT에서 INSERT하면 결제 결과와 Outbox가 같은 TX에서 커밋된다는 보장이 없어집니다. PG 승인 자체와 주문 상태 변경은 이 로컬 TX 밖에 있습니다.
 
+### 함께 롤백되는지 실패를 넣어 확인했다
+
+저장 경계를 확인하려고 Spring 트랜잭션 프록시와 JdbcTemplate을 사용하는 별도 검증 모델에 실패를 넣었습니다. Outbox INSERT 뒤에는 같은 TX 안에서 결제 확정 결과와 Outbox가 각각 1행인지 먼저 확인했습니다. 결제 저장과 Outbox 저장의 `CONNECTION_ID()`도 같았습니다. 실패 뒤 상태는 **다른 DB 연결에서 다시 조회**했습니다.
+
+| 실패를 넣은 위치 | 결제 상태 | 확정 결과 / Outbox |
+|---|---|---:|
+| 결제 상태와 확정 결과 SQL 실행 후, Outbox INSERT 전 예외 | PENDING | 0행 / 0행 |
+| Outbox INSERT 실행 후, 커밋 전 예외 | PENDING | 0행 / 0행 |
+| Outbox INSERT 실행 후, 커밋 전 자식 JVM 강제 종료 | PENDING | 0행 / 0행 |
+| 커밋 직후, Kafka 전송 전 자식 JVM 강제 종료 | APPROVED | 1행 / PENDING 1행 |
+
+예외는 Spring 프록시 밖으로 전파되도록 했고, 프로세스 종료는 종료 훅을 실행하지 않는 `Runtime.halt()`로 넣었습니다. 커밋 전 종료에서는 미커밋 변경이 남지 않았습니다. 커밋 후 종료에서는 PENDING이 남았고, 새 프로세스의 Relay로 발행한 뒤 주문 변경 횟수는 1회였습니다.
+
+TX를 나눈 대조에서는 결제 결과를 먼저 커밋하고 뒤의 Outbox 저장 TX를 실패시켰습니다. 이때는 **APPROVED와 확정 결과 1행만 남고 Outbox는 0행**이었습니다. 두 저장을 같은 TX에 두어야 하는 이유를 이 차이로 확인했습니다. 정상 경로에서도 같은 확정 결과를 두 번 기록했을 때 결제 변경과 결과, Outbox는 각각 한 번만 저장됐습니다.
+
 이벤트는 확정 순간의 `eventId`, 원주문과 결제 식별자, 결과 순번과 금액을 담아 저장합니다. Relay가 재발행할 때도 **동일 ID와 payload**를 사용합니다. 발행 시점의 현재 결제를 다시 직렬화하면, 승인 후 환불된 결제를 승인 사건의 내용으로 보내는 문제가 생길 수 있습니다.
 
-결제 서비스 안의 1분 주기 대사는 PG 결과가 미확정인 시도를 확인합니다. Outbox는 이미 확정된 결과를 후속 처리에 전달하는 데 사용합니다. 도입 전에 누락된 이벤트에는 Outbox 행이 없으므로, 당시의 불변 확정 내역과 주문 적용 이력을 대조하는 별도 복구가 필요합니다. Outbox 도입만으로 과거에 누락된 이벤트가 자동 복구되는 것은 아닙니다.
+결제 서비스 안의 1분 주기 대사는 PG 결과가 미확정인 시도를 확인합니다. Outbox는 이미 확정된 결과를 후속 처리에 전달하는 데 사용합니다. 도입 전에 누락된 이벤트에는 Outbox 행이 없으므로, 이미 저장된 불변 확정 내역에서 발행 기록을 복원하는 별도 backfill 경로를 검증했습니다. 복구 뒤 누락 주문만 새로 반영됐는지는 주문 적용 이력으로 확인했습니다.
 
 ## 3. 지연되어서 좋은 데이터는 없다.
 
@@ -146,6 +161,22 @@ Relay가 ACK를 받은 직후 PUBLISHED 기록 전에 종료되면 같은 이벤
 
 Consumer는 **주문 TX 커밋 후 offset을 커밋**합니다. 그 사이에 종료되면 다시 읽을 수 있지만 적용 이력이 중복 변경을 막습니다. offset을 먼저 커밋하면 주문에 적용하지 못한 이벤트를 건너뛸 수 있습니다. 이 검증은 실제 PG 재승인이나 환불, 재고 변경, 다중 Relay의 인계를 다루지는 않습니다. DB 연결 장애도 같은 결과를 다시 기록한 검증이며 자동 백오프 정책 전체를 입증한 것은 아닙니다.
 
+### 도입 전에 누락된 결과는 별도로 복구했다
+
+같은 검증 모델에서 Outbox가 없던 기간의 상태를 준비했습니다. A는 결제 확정 결과만 있고 주문에는 미반영된 건입니다. B는 HTTP로 이미 주문에 반영됐고, 기존 Kafka 이벤트도 한 번 전달됐지만 Outbox 행은 없는 건입니다. **이미 처리된 주문이 복구 대상에 함께 포함돼도 안전한지** 확인하려고 B를 함께 넣었습니다.
+
+복구에는 확정 내역에 저장된 eventId와 원주문, 결제 시도, 결과 순번, 금액과 통화, 확정 시각과 snapshot을 사용했습니다. 해당 결제 행을 잠근 뒤 `(paymentId, eventSequence)`의 Outbox가 없을 때만 PENDING을 추가했습니다. 이미 있으면 ID와 payload가 같은지 확인하고 기존 상태를 유지했습니다.
+
+| 대상 | 복구 전 → 복구 후 주문 변경 횟수 | Kafka 기록 |
+|---|---:|---:|
+| 미반영 A | 0회 → 1회 | 0건 → 1건 |
+| 이미 반영된 B | 1회 → 1회 | 1건 → 2건, 동일 eventId와 payload |
+| 완료 뒤 backfill과 Relay 재실행 | 추가 변경 0회 | 신규 전송 0건 |
+
+8개 스레드에서 두 결제의 backfill을 총 16회 호출했을 때는 **신규 기록 2회, 기존 기록 확인 14회**였습니다. 결과별 Outbox는 1행씩 남았습니다. backfill INSERT 뒤 커밋 전 실패도 넣었으며, 롤백된 행은 재실행으로 다시 만들 수 있었습니다.
+
+복구 중 모의 PG의 **추가 승인과 조회는 모두 0회**였고 결제 상태 변경 횟수도 늘지 않았습니다. 이미 확정된 사실을 다시 전달했기 때문입니다. 불변 결과가 없거나 원주문 연결이 다르면 복구를 거절했고, 기존 Outbox의 payload가 다를 때도 덮어쓰지 않았습니다. 이 검증은 대상을 명시한 두 결제의 복구이며 전체 과거 주문을 자동으로 탐색한 결과는 아닙니다.
+
 승인 뒤 취소처럼 여러 결과를 다룰 때는 중복과 순서도 구분해야 합니다. 같은 paymentId를 key로 사용해도 Relay가 취소를 먼저 send하면 Kafka는 그 제출 순서를 되돌려 주지 않습니다. 선행 미발행 결과가 있으면 같은 결제의 후속 발행만 보류하고, 먼저 도착한 결과를 잃지 않고 복구하는 계약은 아래 보충 자료에 정리했습니다. 이 순서 처리와 부분 환불은 위 승인 모델의 측정 범위와 구분합니다.
 
 ## 6. 관측하기
@@ -168,6 +199,19 @@ PENDING과 BLOCKED는 Relay의 대기와 오류를, PUBLISHED 이후 미반영�
 ---
 
 필요한 구현 조건과 전체 측정 결과는 아래에서 확인할 수 있습니다.
+
+<details>
+<summary>원자적 저장과 도입 전 누락 복구의 검증 조건</summary>
+
+원자성과 backfill 검증에는 별도 MySQL 8.4, Kafka 4.1.2 브로커 3개와 복제 계수 3, min ISR 2, `acks=all`을 사용했습니다. Spring 6.2.5의 `@EnableTransactionManagement`로 생성한 프록시 빈을 외부에서 호출하고, `DataSourceTransactionManager`와 JdbcTemplate으로 결제 데이터와 Outbox를 같은 트랜잭션 연결에 저장했습니다. 내부 체크포인트에서는 트랜잭션 활성 여부와 연결 ID, 실제 INSERT 결과를 확인했습니다. [Spring의 JDBC 트랜잭션 연결 관리](https://docs.spring.io/spring-framework/reference/data-access/jdbc/connections.html)
+
+예외는 unchecked exception을 사용했습니다. 자식 JVM의 커밋 전 종료는 Outbox INSERT 직후에, 커밋 후 종료는 Spring의 `afterCommit()` 콜백에서 수행했습니다. 후자의 콜백은 종료 시점을 고정하기 위한 장치이며 Kafka 발행을 수행하지 않았습니다. 따라서 커밋 뒤 발행되지 않은 PENDING을 다음 실행이 다시 찾는 경계를 확인할 수 있었습니다. [Spring의 롤백 규칙](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/rolling-back.html)
+
+복구 대상의 확정 내역에는 결과별 eventId와 불변 snapshot이 이미 남아 있다는 전제를 두었습니다. Outbox가 없다는 이유로 새로운 사건 ID를 만들거나 현재 결제를 승인 이벤트로 다시 직렬화하지 않았습니다. B의 기존 Kafka 기록과 backfill 뒤 기록은 payload 문자열도 같았습니다. 주문 적용은 HTTP와 Kafka 모두 같은 업무 적용 경로를 거쳐, 적용 이력과 주문 변경을 주문 DB의 별도 TX에 저장했습니다.
+
+복구는 원주문과 결제 시도, 순번과 금액, 통화를 검증한 뒤 결제 행 잠금과 결과별 유일성 제약 안에서 수행했습니다. 기존 PUBLISHED를 PENDING으로 되돌리지 않았으며 완료 뒤 다시 실행한 Relay의 신규 전송은 0건이었습니다. 원본이 없거나 충돌하면 추정하지 않고 중단했습니다. 복구 대상을 고르는 전체 기간 조회와 페이징, 대규모 backfill의 진행 관리, 실제 PG나 운영 서비스 전체의 동작은 이 검증에 포함하지 않았습니다. 앞의 63회 지연 및 자원 측정과도 별도의 검증입니다.
+
+</details>
 
 <details>
 <summary>이벤트에 담은 확정 정보와 Zero Payload 검토</summary>
