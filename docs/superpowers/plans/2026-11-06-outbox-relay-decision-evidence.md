@@ -84,3 +84,13 @@ Compression review: no technical/evidence regression; fixed particle corruption 
 - [x] Render and review wording diff, preserve measured numbers, validate local links, image dimensions and nested details.
 - [x] State that production uses Amazon MSK and the local comparison reproduces the same delivery structure; do not claim identical infrastructure.
 - [ ] Publish and confirm public HTML/Markdown/CSS/eightPNG bytes.
+
+### Task 7: Three broker replication validation and full rerun
+
+- [x] Preserve single broker measurements; create an isolated Kafka3 broker/controller3 cluster with RF3/minISR2 and all client broker paths proxied. Production uses Amazon MSK; local measurements do not reproduce MSK instance/AZ performance.
+- [x] Verify actual replica/ISR and acks=all waiting for a paused ISR follower, ISR2 success, ISR1 NOT_ENOUGH_REPLICAS and PENDING preservation, same-ID recovery, graceful leader change and ID readback.
+- [x] Repeat27 Relay comparisons and5 recovery checks with RF3.
+- [x] Repeat12 resource,6 backlog and18 HTTP trials; independently validate CSV quantiles and DB/broker results.
+- [x] Replace all benchmark values and configuration descriptions and independently review the final article.
+
+RF3 review: no important issues. All63 measured runs/25,740events passed; final Admin receipt confirms85topics RF3/minISR2/ISR3. Public deployment gate and exact-byte readback are recorded after push in the local rf3-deployment-verification.json artifact.

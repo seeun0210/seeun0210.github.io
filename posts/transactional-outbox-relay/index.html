@@ -7,7 +7,7 @@
 <h2 id="section-1">1. 결제는 됐다는데, 주문은 어디 갔을까</h2>
 <p>처음에는 판매자 화면의 갱신 문제를 의심했습니다. 그런데 주문 조회 API에서도 해당 주문은 결제 대기였습니다. 화면을 새로고침해서 해결할 일이 아니었습니다.</p>
 <p>같은 주문번호로 APM과 요청 로그를 따라갔습니다. 결제 서비스에는 PG 승인 성공과 결제 결과 저장 기록이 있었지만, 주문 서비스에는 그 결과를 반영한 기록이 없었습니다. 여기서 확인한 것은 <strong>결제 결과와 주문 상태가 일치하지 않는다는 사실</strong>입니다. 이것만으로 HTTP 응답 유실인지, 이벤트 발행이나 적용 실패인지까지 확정할 수는 없었습니다.</p>
-<p>여러 축제의 여러 푸드트럭이 플랫폼을 사용하고 고객은 QR로 메뉴를 열어 주문합니다. 주문 서비스와 결제 서비스는 배포 단위가 분리돼 있습니다. 같은 MySQL 인스턴스를 사용하지만 각자 소유한 테이블과 독립적인 트랜잭션을 관리합니다. 결제 서비스는 승인과 취소, 환불뿐 아니라 판매자별 정산과 지급대행도 담당합니다. 운영의 Kafka 브로커는 Amazon MSK를 사용합니다.</p>
+<p>여러 축제의 여러 푸드트럭이 플랫폼을 사용하고 고객은 QR로 메뉴를 열어 주문합니다. 주문 서비스와 결제 서비스는 배포 단위가 분리돼 있습니다. 같은 MySQL 인스턴스를 사용하지만 각자 소유한 테이블과 독립적인 트랜잭션을 관리합니다. 결제 서비스는 승인과 취소, 환불뿐 아니라 판매자별 정산과 지급대행도 담당합니다. 운영의 Kafka는 Amazon MSK의 브로커 3개로 구성했습니다.</p>
 <p><a target="_blank" rel="noopener noreferrer" href="/assets/posts/transactional-outbox-relay/01-00-architecture-without-db-label-v2.png"><img src="/assets/posts/transactional-outbox-relay/01-00-architecture-without-db-label-v2.png" alt="주문과 결제 처리 흐름과 각 트랜잭션 경계" style="max-width: 100%;" loading="lazy" decoding="async" width="2832" height="1632"></a></p>
 <p>정상 경로는 주문 서비스 → 결제 서비스 → PG의 동기 HTTP 호출입니다. 결제 결과가 돌아오면 주문 서비스가 자기 TX에서 <strong>결제 확인 후 판매자 수락 대기</strong>를 기록합니다. 이후 판매자가 수락하면 조리 중으로 넘어갑니다.</p>
 <p>결제 커밋 뒤 HTTP 응답을 놓치거나, 응답을 받은 주문 서비스가 DB에 기록하기 전에 종료되면 결제만 성공한 상태가 남을 수 있습니다. 같은 MySQL을 사용해도 두 서비스의 처리가 하나의 로컬 TX에 포함되지는 않습니다. 따라서 타임아웃을 승인 실패로 바꾸지 않고 기존 <code class="notranslate">paymentAttemptId</code>의 결과부터 확인해야 했습니다.</p>
@@ -41,7 +41,7 @@
 <p>Outbox에 결과를 남겨도 언제 전달될지는 별개의 문제였습니다. 주문이 몰릴 때는 결제 결과와 Outbox가 있는데도 판매자가 주문을 뒤늦게 확인하는 문제가 남았습니다. PG 승인이 늦은 것과 <strong>승인이 끝난 뒤 전달을 기다리는 것</strong>부터 구분했습니다.</p>
 <p>기존 Relay는 한 회차 최대 100건을 먼저 send한 뒤 모든 future를 공통 마감까지 수집하고, 결과를 한 번에 기록했습니다. <code class="notranslate">fixedDelay=5000</code>이므로 다음 조회는 <strong>회차 처리 시간 + 5초 뒤</strong>였습니다. 처리 시간이 0이어도 회차당 100건이면 초당 20건을 넘기기 어렵습니다. 이는 코드에서 계산한 상한이며 측정한 최대 처리량은 아닙니다. <a href="https://docs.spring.io/spring-framework/reference/integration/scheduling.html" rel="nofollow">Spring fixedDelay의 실행 기준</a></p>
 <p>먼저 폴링 주기로 생기는 대기 시간을 줄였습니다. 운영 당시 회고로 HTTP 반영을 놓친 주문의 결제 확정 후 반영 지연은 약 5초에서 약 200ms로 줄었습니다. 이 근사값을 평균이나 p95로 부르지는 않습니다. 아래는 별도로 정의한 구간을 로컬 모델에서 측정한 결과입니다.</p>
-<p>비교에서는 운영과 같은 <strong>MySQL Outbox → Kafka → 주문 DB 반영 구조</strong>를 로컬에 구성했습니다. 비교 환경은 MySQL 8.4와 Kafka 4.1.2 단일 브로커이며, 같은 선전송과 일괄 기록 Relay의 fixedDelay만 5초와 100ms로 바꿨습니다. 같은 JVM의 단조 시계로 <strong>결제 커밋 완료 확인 → 주문 DB 커밋 완료 확인</strong>을 기록했습니다. 실제 PG와 판매자 화면 갱신 시간은 포함하지 않았습니다.</p>
+<p>비교에서는 운영과 같은 <strong>MySQL Outbox → Kafka → 주문 DB 반영 구조</strong>를 로컬에 구성했습니다. 비교 환경도 Kafka 브로커 3개로 맞추고, 토픽은 복제 계수 3과 <code class="notranslate">min.insync.replicas=2</code>, Producer는 <code class="notranslate">acks=all</code>로 설정했습니다. MySQL 8.4와 Kafka 4.1.2를 사용했으며, 같은 선전송과 일괄 기록 Relay의 fixedDelay만 5초와 100ms로 바꿨습니다. 같은 JVM의 단조 시계로 <strong>결제 커밋 완료 확인 → 주문 DB 커밋 완료 확인</strong>을 기록했습니다. 실제 PG와 판매자 화면 갱신 시간은 포함하지 않았습니다. 운영과 브로커 수를 맞춘 비교이며, MSK 인스턴스와 AZ 간 네트워크 성능을 측정한 결과는 아닙니다.</p>
 <markdown-accessiblity-table><table role="table">
 <thead>
 <tr>
@@ -55,26 +55,26 @@
 <tr>
 <td>200건 중 HTTP 응답을 늦춘 40건을 이벤트로 반영</td>
 <td>해당 40건의 반영 p95</td>
-<td align="right">5,241.0ms</td>
-<td align="right">202.1ms</td>
+<td align="right">4,823.2ms</td>
+<td align="right">132.4ms</td>
 </tr>
 <tr>
 <td>초기 적체 300건 + 신규 400건 지속 유입</td>
 <td>현재까지 커밋된 결과의 미반영 수가 처음 0이 된 시점</td>
-<td align="right">35.69초</td>
-<td align="right">0.68초</td>
+<td align="right">35.70초</td>
+<td align="right">0.69초</td>
 </tr>
 <tr>
 <td>같은 적체 조건</td>
 <td>신규 400건의 반영 p95</td>
-<td align="right">20,212.4ms</td>
-<td align="right">146.9ms</td>
+<td align="right">20,247.9ms</td>
+<td align="right">152.7ms</td>
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
 <p>각 수치는 3회 실행별 값의 중앙값입니다. 첫 조건은 모의 PG HTTP와 목표 유입 20건/초, 두 번째는 PG와 HTTP 없이 목표 초당 20건으로 20초 동안 추가한 별도 비교입니다. 두 조건의 상세 수치는 접힌 측정 자료에 남겼습니다.</p>
-<p>초기 적체 조건에서 기존 300건의 반영은 15.37초에 끝났지만, 그동안 추가된 이벤트 중 미반영 결과가 남아 있었습니다. 미반영 수가 처음 0이 된 시점은 35.69초였고, 변경 후에는 두 시점이 각각 0.56초와 0.68초였습니다. <strong>초기 이벤트의 반영 완료와 신규 유입을 포함한 미반영 수 0은 서로 다른 지표입니다.</strong> 이후에도 약 20초까지 새 이벤트가 들어왔으므로, 미반영 수가 처음 0이 된 시점은 전체 작업 종료 시점과 다릅니다.</p>
-<p>100ms가 모든 환경의 정답은 아닙니다. 적체 비교에서 전체 700건을 반영할 때까지 조회 횟수는 7회에서 159회로 늘었습니다. 폴링 조정은 전달 시작을 기다리는 시간을 줄인 선택이며, DB 조회 비용과 신규 유입률을 초과하는 처리율도 함께 확인해야 했습니다.</p>
+<p>초기 적체 조건에서 기존 300건의 반영은 15.38초에 끝났지만, 그동안 추가된 이벤트 중 미반영 결과가 남아 있었습니다. 미반영 수가 처음 0이 된 시점은 35.70초였고, 변경 후에는 두 시점이 각각 0.59초와 0.69초였습니다. <strong>초기 이벤트의 반영 완료와 신규 유입을 포함한 미반영 수 0은 서로 다른 지표입니다.</strong> 이후에도 약 20초까지 새 이벤트가 들어왔으므로, 미반영 수가 처음 0이 된 시점은 전체 작업 종료 시점과 다릅니다.</p>
+<p>100ms가 모든 환경의 정답은 아닙니다. 적체 비교에서 전체 700건을 반영할 때까지 조회 횟수는 7회에서 160회로 늘었습니다. 폴링 조정은 전달 시작을 기다리는 시간을 줄인 선택이며, DB 조회 비용과 신규 유입률을 초과하는 처리율도 함께 확인해야 했습니다.</p>
 <h2 id="section-4">4. 배치 전체를 기다리지 않는 콜백 Relay를 선택했다</h2>
 <p>폴링을 줄여도 느린 한 건 때문에 회차 전체가 반환하지 못하는 구조는 남았습니다. 기존에도 여러 send가 진행됐으므로 이미 Kafka에 도착한 이벤트는 Consumer가 반영할 수 있었습니다. 이전 회차가 끝날 때까지 <strong>새로 저장된 이벤트의 전송 시작이 지연</strong>됐습니다.</p>
 <p>이를 확인하려고 폴링 100ms, 미완료 한도 16건, 결과 DB 연결 4개를 맞춰 세 구성을 비교했습니다. 초기 160건에 신규 300건을 목표 초당 100건으로 추가하는 로컬 승인 모델입니다. 이 비교에는 PG와 HTTP가 없으며, Spring 서비스 전체를 실행한 결과는 아닙니다.</p>
@@ -89,25 +89,25 @@
 <tbody>
 <tr>
 <td>모든 future를 수집한 뒤 회차별 일괄 기록</td>
-<td align="right">2,266.6ms</td>
+<td align="right">2,307.2ms</td>
 <td align="right">29회</td>
 </tr>
 <tr>
 <td>작업자 16개가 각각 get하고 건별 기록</td>
-<td align="right">1,128.4ms</td>
+<td align="right">1,136.5ms</td>
 <td align="right">460회</td>
 </tr>
 <tr>
 <td>완료 콜백에서 결과 실행기로 넘겨 건별 기록</td>
-<td align="right">1,122.0ms</td>
+<td align="right">1,131.5ms</td>
 <td align="right">460회</td>
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
-<p>지연은 실제 결과 TX 안의 <code class="notranslate">SELECT SLEEP(1)</code>로 만들었습니다. 수치는 실행별 p95의 3회 중앙값입니다. 배치 방식의 첫 이벤트는 약 120.2ms에 이미 주문에 반영됐지만, 17번째 이벤트의 send 시작은 1,233.9ms였습니다. 작업자는 208.8ms, 콜백은 211.4ms였습니다. 이 차이는 <strong>이전 회차가 끝나기 전에 다음 이벤트의 전송을 시작할 수 있도록 한 결과</strong>였습니다.</p>
+<p>지연은 실제 결과 TX 안의 <code class="notranslate">SELECT SLEEP(1)</code>로 만들었습니다. 수치는 실행별 p95의 3회 중앙값입니다. 배치 방식의 첫 이벤트는 약 156.7ms에 이미 주문에 반영됐지만, 17번째 이벤트의 send 시작은 1,239.3ms였습니다. 작업자는 208.3ms, 콜백은 206.1ms였습니다. 이 차이는 <strong>이전 회차가 끝나기 전에 다음 이벤트의 전송을 시작할 수 있도록 한 결과</strong>였습니다.</p>
 <p>추가 지연이 없는 조건과 브로커 응답 경로에 40ms를 넣은 조건도 비교했습니다. 작업자와 콜백의 성능은 비슷했고 순위도 지표에 따라 바뀌었습니다. <code class="notranslate">.get()</code>을 없앴다는 사실만으로 더 빨라진다고 주장할 결과는 아니었습니다. 배치와의 비교에는 결과 커밋 단위 변경도 포함되므로 그 효과를 분리해서 해석해야 합니다.</p>
 <p>그중 콜백을 선택한 이유는 <strong>비동기 send의 완료 흐름을 유지하면서 ACK 대기용 작업자 스레드를 별도로 점유하지 않기 위해서</strong>입니다. 별도 자원 비교에서는 필요한 풀만 생성했고, JVM 스레드 수는 작업자 29개와 콜백 17개, NMT 스택 예약 공간은 55.8MiB와 49.7MiB였습니다. 이 스택 예약 메모리 감소량이 실제 상주 메모리 감소량을 의미하지는 않습니다.</p>
-<p>CPU 시간은 정상 조건에서 876.8ms와 781.7ms였지만 응답 지연 조건에서는 880.7ms와 946.7ms로 순서가 바뀌었습니다. <strong>스레드와 스택 공간의 차이는 확인했지만 CPU 우위는 일관되지 않았습니다.</strong> 이 측정은 같은 JVM에서 실행한 source와 Consumer, Kafka client, JIT와 GC를 포함하며 Relay 전용 CPU가 아닙니다.</p>
+<p>CPU 시간은 정상 조건에서 904.7ms와 989.9ms, 응답 지연 조건에서는 870.4ms와 915.3ms였습니다. <strong>스레드와 스택 공간의 차이는 확인했지만, 짧은 반복 측정만으로 CPU 효율의 일반적인 우위를 판단하지는 않았습니다.</strong> 이 측정은 같은 JVM의 결제 결과 생성과 Consumer, Kafka client, JIT와 GC를 포함하며 Relay 전용 CPU가 아닙니다.</p>
 <p><a target="_blank" rel="noopener noreferrer" href="/assets/posts/transactional-outbox-relay/04-05-relay-flow.png"><img src="/assets/posts/transactional-outbox-relay/04-05-relay-flow.png" alt="처리 슬롯 안에서 조회와 전송하고 완료 콜백으로 결과 기록" style="max-width: 100%;" loading="lazy" decoding="async" width="3032" height="1552"></a></p>
 <p>스케줄러는 조회와 전송 등록 뒤 반환합니다. 다음 회차에서는 사용 가능한 슬롯 수만큼 새 이벤트를 처리합니다. 다음 코드는 실행 경계를 설명하며 오류 회수 구현 전체를 담지는 않습니다.</p>
 <div class="highlight highlight-source-java"><pre class="notranslate"><span class="pl-c1">@</span><span class="pl-c1">Scheduled</span>(<span class="pl-s1">fixedDelayString</span> = <span class="pl-s">"${outbox.relay.poll-delay-ms:100}"</span>)
@@ -191,7 +191,7 @@
 <details>
 <summary>HTTP와 모의 PG 조건별 전체 결과와 측정 경계</summary>
 <h3>전체 주문의 p95만으로 이벤트 반영 지연을 평가할 수 없다</h3>
-<p>운영 당시 회고와 별도로 <strong>로컬 MySQL 8.4, Kafka 4.1.2 단일 브로커, 모의 PG HTTP</strong>에서 같은 구간을 비교했습니다. 실제 PG나 운영 환경의 측정값은 아닙니다. 같은 선전송과 일괄 기록 Relay에서 폴링만 바꿨습니다.</p>
+<p>운영 당시 회고와 별도로 <strong>로컬 MySQL 8.4, Kafka 4.1.2 브로커 3개, 복제 계수 3, min ISR 2, 모의 PG HTTP</strong>에서 같은 구간을 비교했습니다. 실제 PG나 운영 환경의 측정값은 아닙니다. 같은 선전송과 일괄 기록 Relay에서 폴링만 바꿨습니다.</p>
 <p>목표 유입 20건/초로 200건씩 실행하고, 매 5번째 요청은 결제 커밋 뒤 HTTP 응답을 늦춰 이벤트로 반영되도록 했습니다. 실행당 40건이 이 경로에 의존했습니다. 다음은 <strong>3회 실행별 p95의 중앙값</strong>입니다.</p>
 <markdown-accessiblity-table><table role="table">
 <thead>
@@ -204,18 +204,18 @@
 <tbody>
 <tr>
 <td>응답 지연 조건의 전체 200건</td>
-<td align="right">4,217.3ms</td>
-<td align="right">114.0ms</td>
+<td align="right">3,865.0ms</td>
+<td align="right">109.6ms</td>
 </tr>
 <tr>
 <td>그중 이벤트로 반영한 40건</td>
-<td align="right">5,241.0ms</td>
-<td align="right">202.1ms</td>
+<td align="right">4,823.2ms</td>
+<td align="right">132.4ms</td>
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
-<p>개선 후 전체 주문 p95는 <strong>114.0ms</strong>, 이벤트 복구 경로는 <strong>202.1ms</strong>였습니다. HTTP가 먼저 반영하는 주문과 이벤트를 기다리는 주문은 다른 집단입니다. 전체 지표가 좋아도 복구 경로가 그만큼 빠르다는 뜻은 아닙니다. 이 경로의 p95는 반복별로 4,933.6–5,278.9ms에서 133.4–274.7ms로 줄었습니다.</p>
-<p>20ms마다 확인한 미반영 수의 최대치도 실행별 중앙값 <strong>21건 → 3건</strong>, 가장 오래 기다린 미반영 주문의 대기 시간은 <strong>5,343.8ms → 195.3ms</strong>였습니다. 완료된 주문의 분위수와 지금 남아 있는 주문을 함께 봐야 했습니다.</p>
+<p>개선 후 전체 주문 p95는 <strong>109.6ms</strong>, 이벤트 복구 경로는 <strong>132.4ms</strong>였습니다. HTTP가 먼저 반영하는 주문과 이벤트를 기다리는 주문은 다른 집단입니다. 전체 지표가 좋아도 복구 경로가 그만큼 빠르다는 뜻은 아닙니다. 이 경로의 p95는 반복별로 4,805.3–4,897.0ms에서 122.8–145.4ms로 줄었습니다.</p>
+<p>20ms마다 확인한 미반영 수의 최대치도 실행별 중앙값 <strong>21건 → 2건</strong>, 가장 오래 기다린 미반영 주문의 대기 시간은 <strong>5,097.4ms → 136.4ms</strong>였습니다. 완료된 주문의 분위수와 지금 남아 있는 주문을 함께 봐야 했습니다.</p>
 <p>동일 JVM의 <code class="notranslate">System.nanoTime()</code>으로 결제 커밋 완료 확인부터 주문 커밋 완료 확인까지를 기록했습니다. 별도 HTTP 서버와 독립된 DB TX를 사용했으며 판매자 화면 갱신과 수락 시간은 포함하지 않았습니다. 최초 폴링도 각 delay 뒤에 실행했습니다.</p>
 <p>HTTP 비교는 조건마다 200건씩 3회입니다. 다음은 <strong>실행별 p95 / p99의 중앙값, 단위 ms</strong>입니다. 각 실행에서 정렬 후 <code class="notranslate">ceil(p × n)</code>번째 값을 골랐으며 전체 표본을 합친 분위수가 아닙니다. 이벤트 대상 40건의 p99는 그 실행의 최대값입니다.</p>
 <markdown-accessiblity-table><table role="table">
@@ -229,37 +229,37 @@
 <tbody>
 <tr>
 <td>정상 HTTP: 승인 처리 요청 → 주문 반영</td>
-<td align="right">113.6 / 182.7</td>
-<td align="right">77.5 / 93.3</td>
+<td align="right">70.8 / 76.9</td>
+<td align="right">68.2 / 72.3</td>
 </tr>
 <tr>
 <td>응답 지연의 전체 주문: 결제 커밋 → 주문 반영</td>
-<td align="right">4,217.3 / 5,241.0</td>
-<td align="right">114.0 / 202.1</td>
+<td align="right">3,865.0 / 4,823.2</td>
+<td align="right">109.6 / 132.4</td>
 </tr>
 <tr>
 <td>응답 지연의 이벤트 대상: 결제 커밋 → 주문 반영</td>
-<td align="right">5,241.0 / 5,349.5</td>
-<td align="right">202.1 / 215.9</td>
+<td align="right">4,823.2 / 5,102.9</td>
+<td align="right">132.4 / 139.7</td>
 </tr>
 <tr>
 <td>응답 지연의 이벤트 대상: 승인 처리 요청 → 주문 반영</td>
-<td align="right">5,305.0 / 5,421.8</td>
-<td align="right">268.7 / 309.2</td>
+<td align="right">4,881.5 / 5,167.1</td>
+<td align="right">189.4 / 197.8</td>
 </tr>
 <tr>
 <td>PG 지연: 승인 처리 요청 → 주문 반영</td>
-<td align="right">8,598.9 / 9,154.6</td>
-<td align="right">4,247.8 / 4,281.0</td>
+<td align="right">8,250.8 / 8,621.0</td>
+<td align="right">4,156.8 / 4,179.1</td>
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
 <p>응답 지연 조건은 매 5번째 요청의 결제 HTTP 응답을 커밋 후 5초 늦춰 호출자의 4초 타임아웃을 넘겼습니다. PG 지연 조건은 모의 PG의 rolling 1초 호출이 9건을 넘으면 성공 응답을 3초 늦춘 조건입니다. 실제 NICEPAY의 호출 한도나 지연 곡선이 아닙니다.</p>
-<p>폴링을 줄여도 PG 지연 조건의 요청부터 반영까지 p95는 약 4.25초 남았습니다. <strong>Relay는 확정 이후의 전달 대기를 줄이며 PG 대기를 없애지는 않습니다.</strong> 정상 HTTP 경로의 작은 차이도 폴링 변경만의 효과로 단정하지 않습니다.</p>
-<p>PG 지연 조건에서 20ms마다 확인한 최대 미반영 수의 실행별 중앙값은 56건 → 5건, 가장 오래 기다린 미반영 주문의 대기 시간은 5,183.6ms → 269.6ms였습니다. 샘플링 사이의 최대치는 놓칠 수 있습니다.</p>
+<p>폴링을 줄여도 PG 지연 조건의 요청부터 반영까지 p95는 약 4.16초 남았습니다. <strong>Relay는 확정 이후의 전달 대기를 줄이며 PG 대기를 없애지는 않습니다.</strong> 정상 HTTP 경로의 작은 차이도 폴링 변경만의 효과로 단정하지 않습니다.</p>
+<p>PG 지연 조건에서 20ms마다 확인한 최대 미반영 수의 실행별 중앙값은 53건 → 4건, 가장 오래 기다린 미반영 주문의 대기 시간은 4,691.4ms → 160.7ms였습니다. 샘플링 사이의 최대치는 놓칠 수 있습니다.</p>
 <p>HTTP 비교의 총 18회 3,600건은 Kafka 기록과 결제 결과, Outbox와 주문 DB를 대조했고 최종 미반영은 모두 0건이었습니다. 종료 시점의 0건이 실행 중에도 항상 0건이었다는 뜻은 아닙니다.</p>
-<p>적체 비교는 같은 MySQL와 Kafka에서 PG와 HTTP를 제외한 별도 전달 모델입니다. 초기 적체 해소 시간은 초기 300건 중 마지막 주문 커밋에서, 신규 지연은 각 신규 결과 커밋에서 계산했습니다. 미반영 수가 처음 0이 된 시점은 각 결과의 커밋 시각과 주문 적용 시각을 정렬해 계산했습니다. 슬롯 대기나 화면 갱신 시간의 추정값이 아닙니다.</p>
-<p>신규 커밋의 실제 첫 시각과 마지막 시각으로 계산한 유입률은 6회 모두 19.991–19.994건/초 범위였습니다. 총 4,200건의 고유 ID와 Kafka 기록, 승인 결과, PUBLISHED, 주문 적용 1회와 inbox를 대조했고 최종 미반영은 모두 0건이었습니다. 반복별 신규 p95는 기존 20,205.1–20,230.1ms, 변경 후 142.4–148.2ms였습니다.</p>
+<p>적체 비교는 같은 MySQL과 Kafka에서 PG와 HTTP를 제외한 별도 전달 모델입니다. 초기 적체 해소 시간은 초기 300건 중 마지막 주문 커밋에서, 신규 지연은 각 신규 결과 커밋에서 계산했습니다. 미반영 수가 처음 0이 된 시점은 각 결과의 커밋 시각과 주문 적용 시각을 정렬해 계산했습니다. 슬롯 대기나 화면 갱신 시간의 추정값이 아닙니다.</p>
+<p>신규 커밋의 실제 첫 시각과 마지막 시각으로 계산한 유입률은 6회 모두 19.992–19.998건/초 범위였습니다. 총 4,200건의 고유 ID와 Kafka 기록, 승인 결과, PUBLISHED, 주문 적용 1회와 inbox를 대조했고 최종 미반영은 모두 0건이었습니다. 반복별 신규 p95는 기존 20,227.0–20,259.6ms, 변경 후 151.3–157.0ms였습니다.</p>
 <p>이 결과는 <strong>폴링 간격 변경의 전달 대기와 제한된 적체 해소 비교</strong>입니다. Relay 구성 비교는 폴링을 100ms로 고정한 별도 모델입니다. 실제 서비스의 부분 환불이나 다중 Relay, 장기 운영 누락률을 검증한 결과는 아닙니다.</p>
 </details>
 <details>
@@ -278,32 +278,32 @@
 <tbody>
 <tr>
 <td>초기 300건의 주문 반영 완료</td>
-<td align="right">15.37초</td>
-<td align="right">0.56초</td>
+<td align="right">15.38초</td>
+<td align="right">0.59초</td>
 </tr>
 <tr>
 <td>그 시점까지 커밋된 결과의 미반영 수가 처음 0이 됨</td>
-<td align="right">35.69초</td>
-<td align="right">0.68초</td>
+<td align="right">35.70초</td>
+<td align="right">0.69초</td>
 </tr>
 <tr>
 <td>새로 들어온 400건의 반영 p95</td>
-<td align="right">20,212.4ms</td>
-<td align="right">146.9ms</td>
+<td align="right">20,247.9ms</td>
+<td align="right">152.7ms</td>
 </tr>
 <tr>
 <td>시작 후 첫 1초에 들어온 20건의 반영 p95</td>
-<td align="right">20,267.0ms</td>
-<td align="right">516.3ms</td>
+<td align="right">20,278.5ms</td>
+<td align="right">554.1ms</td>
 </tr>
 <tr>
 <td>700건을 모두 반영할 때까지 조회 횟수</td>
 <td align="right">7회</td>
-<td align="right">159회</td>
+<td align="right">160회</td>
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
-<p>5초 폴링은 초기 300건을 처리한 뒤에도 새로 유입된 미반영 이벤트가 남아 있었습니다. 100ms 폴링은 신규 이벤트가 계속 유입되는 동안 미반영 수가 0이 된 시점이 있었습니다. <strong>미반영 수가 처음 0이 된 시점은 전체 작업 종료 시점과 다릅니다.</strong> 이후에도 약 20초까지 새 이벤트가 들어왔고, 마지막 유입 후 전체 반영까지는 각각 15.73초와 0.08초가 더 걸렸습니다.</p>
+<p>5초 폴링은 초기 300건을 처리한 뒤에도 새로 유입된 미반영 이벤트가 남아 있었습니다. 100ms 폴링은 신규 이벤트가 계속 유입되는 동안 미반영 수가 0이 된 시점이 있었습니다. <strong>미반영 수가 처음 0이 된 시점은 전체 작업 종료 시점과 다릅니다.</strong> 이후에도 약 20초까지 새 이벤트가 들어왔고, 마지막 유입 후 전체 반영까지는 각각 15.74초와 0.10초가 더 걸렸습니다.</p>
 <p>개선 후에도 전체 신규 이벤트 p95보다 시작 직후 20건의 p95가 컸습니다. 이 주문들은 초기 적체 뒤에서 기다렸기 때문입니다. 평상시와 복구 직후의 결과를 합쳐 계산하면 초기 유입 이벤트의 긴 지연을 확인하기 어렵습니다.</p>
 <p>폴링을 줄인 비용도 있습니다. 100ms는 다음 조회 전의 최소 대기이지 초당 10회 실행 보장이 아닙니다. 조회와 전송, 결과 기록 시간이 더해지며, 이 실행에서도 조회 횟수는 증가했습니다. <strong>DB CPU와 잠금 경합, 장기 최대 처리량까지 측정한 결과는 아닙니다.</strong></p>
 <p>Relay의 용량을 계산할 때는 발행 완료 기준의 지속 처리율을 <code class="notranslate">μ</code>(건/초), Outbox 신규 유입률을 <code class="notranslate">λ</code>(건/초), 그 시점의 미발행 적체를 <code class="notranslate">B</code>(건)로 맞춥니다. 일정한 속도와 <code class="notranslate">μ &gt; λ</code>를 가정한 해소 시간은 <code class="notranslate">B / (μ − λ)</code>로 근사할 수 있습니다. <code class="notranslate">μ ≤ λ</code>이면 신규 유입이 계속되는 동안 적체를 해소할 수 없습니다. 기존 설정은 처리 시간이 0이어도 상한이 초당 20건이어서, 목표 유입 20건/초에서는 신규 유입을 처리한 뒤 적체를 줄일 추가 처리율이 없었습니다. 이때는 한 배치의 처리 완료와 별개로 <strong>신규 유입률을 초과하는 처리율</strong>이 필요했습니다.</p>
@@ -324,30 +324,30 @@
 <tbody>
 <tr>
 <td>추가 지연 없음</td>
-<td align="right">1,255.0 / 1,302.6</td>
-<td align="right">1,072.8 / 1,140.2</td>
-<td align="right">1,077.1 / 1,141.7</td>
+<td align="right">1,267.4 / 1,334.2</td>
+<td align="right">1,082.7 / 1,159.2</td>
+<td align="right">1,085.0 / 1,151.1</td>
 </tr>
 <tr>
 <td>첫 이벤트의 결과 기록 TX만 1초 지연</td>
-<td align="right">2,266.6 / 2,327.6</td>
-<td align="right">1,128.4 / 1,193.5</td>
-<td align="right">1,122.0 / 1,176.7</td>
+<td align="right">2,307.2 / 2,360.9</td>
+<td align="right">1,136.5 / 1,187.6</td>
+<td align="right">1,131.5 / 1,185.8</td>
 </tr>
 <tr>
 <td>브로커 응답 경로에 40ms 지연</td>
-<td align="right">1,878.6 / 1,911.5</td>
-<td align="right">1,134.6 / 1,206.0</td>
-<td align="right">1,131.8 / 1,211.1</td>
+<td align="right">1,897.8 / 1,919.1</td>
+<td align="right">1,164.7 / 1,236.1</td>
+<td align="right">1,160.8 / 1,226.6</td>
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
 <p>작업자와 콜백의 순위는 조건과 지표에 따라 조금씩 바뀌었습니다. <strong>이 결과로 콜백의 처리량 우위를 주장하지는 않습니다.</strong> 확인한 것은 배치 전체 대기를 제거한 두 구성이 비슷한 성능을 냈다는 점입니다.</p>
-<p>한 건의 DB 기록을 늦춘 조건에서 차이가 생긴 위치도 확인했습니다. 배치 방식의 첫 이벤트는 시작 후 약 <strong>120.2ms에 주문에 반영</strong>됐습니다. 하지만 그 결과를 기록하는 TX가 1초 지연되면서 17번째 이벤트의 send 시작은 <strong>1,233.9ms</strong>였습니다. 같은 이벤트의 시작은 작업자 방식 <strong>208.8ms</strong>, 콜백 <strong>211.4ms</strong>였습니다. 각 실행의 시각을 비교한 중앙값입니다. 이 차이는 <strong>이전 회차가 끝나기 전에 다음 이벤트의 전송을 시작할 수 있도록 한 결과</strong>입니다.</p>
+<p>한 건의 DB 기록을 늦춘 조건에서 차이가 생긴 위치도 확인했습니다. 배치 방식의 첫 이벤트는 시작 후 약 <strong>156.7ms에 주문에 반영</strong>됐습니다. 하지만 그 결과를 기록하는 TX가 1초 지연되면서 17번째 이벤트의 send 시작은 <strong>1,239.3ms</strong>였습니다. 같은 이벤트의 시작은 작업자 방식 <strong>208.3ms</strong>, 콜백 <strong>206.1ms</strong>였습니다. 각 실행의 시각을 비교한 중앙값입니다. 이 차이는 <strong>이전 회차가 끝나기 전에 다음 이벤트의 전송을 시작할 수 있도록 한 결과</strong>입니다.</p>
 <p>여기에는 비용도 있습니다. 실행당 460건을 처리할 때 배치 방식의 결과 커밋은 <strong>29회</strong>, 나머지 두 방식은 <strong>460회</strong>였습니다. 전송 완료 수집과 결과 기록 단위를 함께 바꾼 전체 구조 비교이며, <code class="notranslate">.get()</code>과 콜백 API만 바꾼 비교가 아닙니다. 커밋 횟수로 DB CPU나 커밋 소요 시간까지 추정하지 않습니다.</p>
-<p>Kafka client와 broker 4.1.2, MySQL 8.4 단일 인스턴스, broker 1개와 partition 3개, 결과 연결 풀 4개를 사용했습니다. PG와 HTTP를 제외한 전달 경로 비교입니다. 이벤트에는 원주문과 결제, 시도, 결과 순번과 금액을 넣고, key는 paymentId로 보냈습니다. 모든 이벤트는 서로 다른 결제의 승인 결과이며, 같은 결제의 후속 환불 순서까지 실행한 것은 아닙니다.</p>
+<p>Kafka client와 broker 4.1.2, MySQL 8.4 단일 인스턴스, broker 3개, 복제 계수 3, min ISR 2와 partition 3개, 결과 연결 풀 4개를 사용했습니다. PG와 HTTP를 제외한 전달 경로 비교입니다. 이벤트에는 원주문과 결제, 시도, 결과 순번과 금액을 넣고, key는 paymentId로 보냈습니다. 모든 이벤트는 서로 다른 결제의 승인 결과이며, 같은 결제의 후속 환불 순서까지 실행한 것은 아닙니다.</p>
 <p>초기 160건의 결과와 Outbox를 커밋한 뒤 시작했습니다. 신규 300건은 목표 10ms 간격으로 추가하고, 같은 JVM의 단조 시계로 결제 커밋 반환부터 주문 TX 커밋 반환까지 기록했습니다. Consumer는 적용 이력과 주문 변경을 같은 TX에 저장한 뒤 offset을 커밋했습니다. 신규 300건의 nearest-rank 분위수를 실행별로 계산했습니다.</p>
-<p>첫 이벤트의 결과 기록 지연은 실제 결과 TX 안의 <code class="notranslate">SELECT SLEEP(1)</code>입니다. 배치에서는 해당 회차의 결과 커밋이, 나머지 두 방식에서는 그 이벤트의 커밋이 지연됩니다. Kafka ACK나 PG 응답을 늦춘 조건이 아닙니다. 브로커 응답 지연은 Toxiproxy downstream 전체에 40ms를 추가했으므로 produce ACK뿐 아니라 같은 경로의 다른 브로커 응답도 영향을 받습니다.</p>
+<p>첫 이벤트의 결과 기록 지연은 실제 결과 TX 안의 <code class="notranslate">SELECT SLEEP(1)</code>입니다. 배치에서는 해당 회차의 결과 커밋이, 나머지 두 방식에서는 그 이벤트의 커밋이 지연됩니다. Kafka ACK나 PG 응답을 늦춘 조건이 아닙니다. 브로커 응답 지연은 브로커 3개의 클라이언트 연결 경로 모두에 Toxiproxy downstream 지연 40ms를 추가했습니다. produce ACK와 해당 경로의 다른 브로커 응답이 영향을 받으며, 브로커 사이의 복제 통신에는 지연을 주입하지 않았습니다.</p>
 <p>세 조건에서 순서를 회전하며 각 방식 3회, 총 27회 실행했습니다. 다음 처리량은 <strong>각 실행의 전체 460건 / 마지막 PUBLISHED 커밋까지의 경과 시간</strong>을 계산한 중앙값입니다. 초기 적체와 유입 시간을 포함하므로 지속 가능한 최대 처리량이 아닙니다.</p>
 <markdown-accessiblity-table><table role="table">
 <thead>
@@ -361,21 +361,21 @@
 <tbody>
 <tr>
 <td>추가 지연 없음</td>
-<td align="right">131.3건/초</td>
-<td align="right">151.6건/초</td>
-<td align="right">150.1건/초</td>
-</tr>
-<tr>
-<td>첫 이벤트 결과 기록 1초 지연</td>
-<td align="right">101.5건/초</td>
-<td align="right">146.2건/초</td>
-<td align="right">146.2건/초</td>
-</tr>
-<tr>
-<td>브로커 응답 경로 40ms 지연</td>
-<td align="right">96.1건/초</td>
+<td align="right">130.3건/초</td>
+<td align="right">151.1건/초</td>
 <td align="right">150.0건/초</td>
-<td align="right">149.8건/초</td>
+</tr>
+<tr>
+<td>첫 이벤트의 결과 기록 TX만 1초 지연</td>
+<td align="right">99.9건/초</td>
+<td align="right">146.1건/초</td>
+<td align="right">146.6건/초</td>
+</tr>
+<tr>
+<td>브로커 응답 경로에 40ms 지연</td>
+<td align="right">97.0건/초</td>
+<td align="right">149.6건/초</td>
+<td align="right">149.5건/초</td>
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
@@ -413,18 +413,18 @@
 </tr>
 <tr>
 <td>처리 완료 시 JVM RSS</td>
-<td align="right">224.4MiB</td>
-<td align="right">223.1MiB</td>
+<td align="right">223.6MiB</td>
+<td align="right">223.8MiB</td>
 </tr>
 <tr>
 <td>460건 처리 구간의 JVM CPU 시간</td>
-<td align="right">876.8ms</td>
-<td align="right">781.7ms</td>
+<td align="right">904.7ms</td>
+<td align="right">989.9ms</td>
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
 <p>콜백에서 JVM 스레드는 <strong>12개</strong>, NMT의 스택 예약 공간은 약 <strong>6.1MiB</strong> 적었습니다. 하지만 스택 예약과 커밋은 OS가 실제 상주시킨 메모리인 RSS와 다릅니다. 이 환경에서 두 NMT 값은 같게 보고됐으며, 그 차이가 실제 상주 메모리 감소량을 의미하지는 않습니다.</p>
-<p>CPU 시간도 콜백이 항상 작지는 않았습니다. 추가 지연 없는 조건의 반복 범위는 작업자 850.8–966.1ms와 콜백 766.2–943.6ms였고, 브로커 응답 지연 조건에서는 각각 732.0–881.7ms와 776.2–986.9ms였습니다. <strong>두 조건 모두 범위가 겹쳤습니다.</strong> 이 표본에서는 ACK 대기 스레드와 스택 공간의 차이가 분명했고, CPU 효율이나 전체 RSS의 일관된 우위까지 입증한 것은 아닙니다.</p>
+<p>정상 조건의 CPU 시간 반복 범위는 작업자 878.0–987.1ms와 콜백 899.2–1,007.9ms, 브로커 응답 지연 조건에서는 각각 857.2–932.6ms와 816.9–937.5ms였습니다. <strong>두 조건 모두 반복 범위가 겹쳤습니다.</strong> ACK 대기 스레드와 스택 공간의 차이는 확인했지만, 이 표본으로 장기 CPU 효율이나 전체 RSS의 일관된 우위까지 판단하지 않습니다.</p>
 <p>Java 21에서 <code class="notranslate">-Xms128m -Xmx384m -Xss512k -XX:NativeMemoryTracking=summary</code>를 동일하게 적용했습니다. 각 실행을 새 JVM으로 시작하고 132건을 워밍업한 뒤, 초기 160건과 신규 300건을 처리하는 12회만 집계했습니다. 방식의 실행 순서는 반복마다 교대했습니다. 총 5,520건의 Kafka 기록과 DB 최종 상태를 확인했습니다.</p>
 <p><code class="notranslate">ThreadMXBean</code>으로 전체 JVM 스레드 수를, <code class="notranslate">jcmd VM.native_memory summary</code>의 Thread 하위 stack으로 예약과 커밋 메모리를, OS의 <code class="notranslate">ps</code> RSS로 프로세스 상주 메모리를 읽었습니다. stack은 Thread 합계의 일부이므로 둘을 더하지 않았습니다. 이 값은 Java heap이나 작업자 스레드만의 메모리도 아닙니다. NMT는 JVM 내부 메모리 추적이며 프로세스 전체 RSS를 대신하지 않습니다. <a href="https://docs.oracle.com/en/java/javase/21/vm/native-memory-tracking.html" rel="nofollow">Java Native Memory Tracking</a></p>
 <p>CPU는 <code class="notranslate">OperatingSystemMXBean.getProcessCpuTime()</code>의 처리 전후 차이입니다. 최초 160건 준비와 NMT 조회는 구간에서 제외했습니다. 같은 JVM에서 실행한 신규 결과 저장과 Relay, Consumer, Kafka client와 JIT, GC의 CPU 시간이 함께 들어 있습니다. Relay 전용 CPU나 MySQL과 Kafka 서버의 CPU가 아닙니다. <a href="https://docs.oracle.com/en/java/javase/21/docs/api/jdk.management/com/sun/management/OperatingSystemMXBean.html#getProcessCpuTime()" rel="nofollow">JVM 프로세스 CPU 시간</a></p>
@@ -453,6 +453,39 @@
 </details>
 <details>
 <summary>Producer 설정과 Outbox 백오프의 책임 구분</summary>
+<h3>복제본의 ACK를 실제로 기다리는지 확인했다</h3>
+<p><code class="notranslate">acks=all</code>이 복제본의 ACK를 기다리는지 확인하려고 브로커 3개, 복제 계수 3, <code class="notranslate">min.insync.replicas=2</code>로 구성했습니다. Admin API에서 실제 replica와 ISR을 확인한 뒤 검증을 시작했습니다. 브로커 두 개를 중단해도 controller quorum을 유지하도록 controller 3개는 별도로 실행했습니다.</p>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>조건</th>
+<th>확인한 결과</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ISR 3개, follower 하나를 잠시 정지</td>
+<td>ISR이 3개인 동안 전송 future가 750ms 후에도 미완료였으며, follower 재개 후 ACK를 받았습니다.</td>
+</tr>
+<tr>
+<td>follower 하나 중단, ISR 2개</td>
+<td>발행에 성공하고 Outbox 결과를 PUBLISHED로 기록했습니다.</td>
+</tr>
+<tr>
+<td>follower 두 개 중단, ISR 1개</td>
+<td><code class="notranslate">NOT_ENOUGH_REPLICAS</code> 응답으로 재시도하다 전송 예산 5초가 지나 타임아웃됐습니다. Outbox는 PENDING으로 유지했습니다.</td>
+</tr>
+<tr>
+<td>브로커 복구, ISR 3개</td>
+<td>같은 eventId와 payload로 재발행해 완료했습니다.</td>
+</tr>
+<tr>
+<td>기존 리더를 정상 중단한 뒤 새 리더 선출</td>
+<td>새 발행에 성공했고, 복구 후 기존 결과를 포함한 고유 ID 5건을 조회했습니다.</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p><code class="notranslate">acks=all</code>은 현재 ISR 전체의 확인을 기다립니다. min ISR 2는 항상 두 개만 기다리라는 설정이 아니라, 그보다 적은 ISR에서 쓰기를 거절하는 조건입니다. 위의 타임아웃 5초는 장애 검증을 위한 예산이며, 아래 Relay 설정의 30초와 구분합니다. 이 검증은 로컬 복제 동작을 다루며 MSK의 AZ 장애나 스토리지 손실까지 재현한 것은 아닙니다. <a href="https://kafka.apache.org/41/configuration/producer-configs/" rel="nofollow">Kafka의 ACK 설정</a>, <a href="https://kafka.apache.org/41/configuration/topic-configs/" rel="nofollow">토픽의 최소 ISR 설정</a></p>
 <h3>Producer 내부 재시도와 Outbox 재발행을 구분한다</h3>
 <div class="highlight highlight-source-ini"><pre class="notranslate"><span class="pl-k">acks</span>=all
 <span class="pl-k">enable.idempotence</span>=true
