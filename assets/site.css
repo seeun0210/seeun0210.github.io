@@ -3,3 +3,5 @@
 @media(max-width:600px){body{font-size:16px;line-height:1.9}.site-header{padding:20px!important}main{padding:40px 20px 64px}h1,.home h1{font-size:29px;line-height:1.5}h2{font-size:23px;margin-top:56px}h3{font-size:20px}.post-entry h2{font-size:24px}.intro{font-size:18px}.byline{font-size:13px;gap:14px}pre{padding:18px 16px;font-size:12px;margin-left:-4px;margin-right:-4px}th,td{min-width:110px;padding:10px 12px}blockquote{padding:17px 20px}.toc{padding:16px}.home .intro{margin-bottom:42px}footer{padding:24px 20px}}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
 @media print{.site-header,.toc,footer{display:none}main{max-width:none;padding:0}pre{white-space:pre-wrap}a{color:inherit}h2,h3{break-after:avoid}img{break-inside:avoid}}
+
+.markdown-body details:not(.toc){margin:32px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.markdown-body details:not(.toc)>summary{cursor:pointer;padding:16px 0;font-size:16px;font-weight:650;color:var(--blue);line-height:1.6}.markdown-body details:not(.toc)[open]>summary{margin-bottom:12px}.markdown-body details:not(.toc)>:last-child{margin-bottom:24px}
