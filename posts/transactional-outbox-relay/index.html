@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>결제는 됐는데 판매자에게 주문이 보이지 않았다: Transactional Outbox와 Relay 개선 | seeun.log</title><meta name="description" content="결제 승인은 끝났지만 주문은 결제 대기에 남았습니다. Transactional Outbox로 결제 결과를 보존하고, Kafka Relay의 발행 지연과 재시도 순서, Consumer 멱등성을 개선한 과정을 정리했습니다."><link rel="canonical" href="https://seeun0210.github.io/posts/transactional-outbox-relay/"><meta property="og:type" content="article"><meta property="og:title" content="결제는 됐는데 판매자에게 주문이 보이지 않았다: Transactional Outbox와 Relay 개선 | seeun.log"><meta property="og:description" content="결제 승인은 끝났지만 주문은 결제 대기에 남았습니다. Transactional Outbox로 결제 결과를 보존하고, Kafka Relay의 발행 지연과 재시도 순서, Consumer 멱등성을 개선한 과정을 정리했습니다."><meta property="og:url" content="https://seeun0210.github.io/posts/transactional-outbox-relay/"><meta property="og:image" content="https://seeun0210.github.io/assets/posts/transactional-outbox-relay/01-00-architecture-without-db-label-v2.png"><link rel="stylesheet" href="/assets/site.css"></head><body><a class="skip" href="#content">본문으로 건너뛰기</a><header class="site-header"><a class="brand" href="/">seeun.log</a><nav aria-label="외부 링크"><a href="https://github.com/seeun0210">GitHub</a></nav></header><main id="content"><article class="markdown-body"><div class="article-top"><h1>결제는 됐는데 판매자에게 주문이 보이지 않았다: Transactional Outbox와 Relay 개선</h1><div class="byline"><a href="https://github.com/seeun0210">seeun</a><time datetime="2026-11-06">2026년 11월 6일</time></div></div><details class="toc"><summary>목차</summary><ol><li><a href="#section-1">결제는 됐다는데, 주문은 어디 갔을까</a></li><li><a href="#section-2">HTTP 응답을 놓쳐도 결제 결과를 다시 전달할 수 있어야 한다</a></li><li><a href="#section-3">결제 결과와 발행할 이벤트를 함께 저장해야 한다</a></li><li><a href="#section-4">지연되어서 좋은 데이터는 없다.</a></li><li><a href="#section-5">느린 한 건이 다른 결제의 발행을 막지 않도록 해야 한다</a></li><li><a href="#section-6">중복과 순서 역전을 구분해 주문에 반영해야 한다</a></li><li><a href="#section-7">관측하기</a></li></ol></details><blockquote>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>결제는 됐는데 판매자에게 주문이 보이지 않았다: Transactional Outbox와 Relay 개선 | seeun.log</title><meta name="description" content="결제 승인은 끝났지만 주문은 결제 대기에 남았습니다. Transactional Outbox로 결제 결과를 보존하고, Kafka Relay의 발행 지연과 재시도 순서, Consumer 멱등성을 개선한 과정을 정리했습니다."><link rel="canonical" href="https://seeun0210.github.io/posts/transactional-outbox-relay/"><meta property="og:type" content="article"><meta property="og:title" content="결제는 됐는데 판매자에게 주문이 보이지 않았다: Transactional Outbox와 Relay 개선 | seeun.log"><meta property="og:description" content="결제 승인은 끝났지만 주문은 결제 대기에 남았습니다. Transactional Outbox로 결제 결과를 보존하고, Kafka Relay의 발행 지연과 재시도 순서, Consumer 멱등성을 개선한 과정을 정리했습니다."><meta property="og:url" content="https://seeun0210.github.io/posts/transactional-outbox-relay/"><meta property="og:image" content="https://seeun0210.github.io/assets/posts/transactional-outbox-relay/01-00-architecture-without-db-label-v2.png"><link rel="stylesheet" href="/assets/site.css"></head><body><a class="skip" href="#content">본문으로 건너뛰기</a><header class="site-header"><a class="brand" href="/">seeun.log</a><nav aria-label="외부 링크"><a href="https://github.com/seeun0210">GitHub</a></nav></header><main id="content"><article class="markdown-body"><div class="article-top"><h1>결제는 됐는데 판매자에게 주문이 보이지 않았다: Transactional Outbox와 Relay 개선</h1><div class="byline"><a href="https://github.com/seeun0210">seeun</a><time datetime="2026-11-06">2026년 11월 6일</time></div></div><details class="toc"><summary>목차</summary><ol><li><a href="#section-1">1. 결제는 됐다는데, 주문은 어디 갔을까</a></li><li><a href="#section-2">2. HTTP 응답을 놓쳐도 결제 결과를 다시 전달할 수 있어야 한다</a></li><li><a href="#section-3">3. 결제 결과와 발행할 이벤트를 함께 저장해야 한다</a></li><li><a href="#section-4">4. 지연되어서 좋은 데이터는 없다.</a></li><li><a href="#section-5">5. 느린 한 건이 다른 결제의 발행을 막지 않도록 해야 한다</a></li><li><a href="#section-6">6. 중복과 순서 역전을 구분해 주문에 반영해야 한다</a></li><li><a href="#section-7">7. 관측하기</a></li></ol></details><blockquote>
 <p>손님은 결제했다는데, 들어온 주문이 없어요.</p>
 </blockquote>
 <p>결제 서비스에는 승인 성공 결과가 남아 있었지만 주문은 <strong>결제 대기</strong>였습니다. 판매자는 주문을 확인할 수 없었고, 고객에게 다시 결제하도록 안내하기도 어려웠습니다. 이미 승인된 결제를 한 번 더 만들 수 있기 때문입니다.</p>
@@ -152,9 +152,80 @@
 } <span class="pl-c">// 메서드 반환 후 5초를 더 기다립니다.</span></pre></div>
 <p>실제 다음 조회까지는 <strong>조회 + 전송 등록 + 배치 결과 대기 + 일괄 기록 + 5초</strong>가 걸립니다. 처리 시간이 0이어도 한 회차 100건과 5초 대기라면 지속 발행량은 초당 20건을 넘기기 어렵습니다. 이는 코드에서 계산한 상한이며 측정한 최대 처리량은 아닙니다. <a href="https://docs.spring.io/spring-framework/reference/integration/scheduling.html" rel="nofollow">Spring fixedDelay의 실행 기준</a></p>
 <p>먼저 폴링 사이의 빈 대기를 줄였습니다. HTTP 반영을 놓친 주문의 결제 확정 후 반영 지연은 운영 당시 회고로 약 5초에서 약 200ms로 줄었습니다. 이 근사값을 평균이나 p95로 부르지는 않습니다. 다음 측정에서는 같은 구간을 별도로 정의해 비교했습니다.</p>
-<h3>개선 전후에 같은 구간을 비교한다</h3>
-<p>측정은 <strong>로컬 MySQL 8.4, Kafka 4.1.2 단일 브로커, 모의 PG HTTP</strong> 환경에서 수행했습니다. 실제 PG나 운영 환경의 측정값은 아닙니다. 같은 JVM의 별도 HTTP 서버와 독립된 DB TX를 사용하고, <code class="notranslate">System.nanoTime()</code>으로 결제 커밋 완료 확인부터 주문 커밋 완료 확인까지를 기록했습니다.</p>
-<p>조건마다 목표 유입 20건/초로 200건씩 3회 실행했습니다. 동일한 선전송과 일괄 기록 Relay에서 <code class="notranslate">fixedDelay</code>만 5초와 100ms로 바꿨고, 최초 실행도 각 delay 후였습니다. 아래는 <strong>실행별 p95 / p99의 중앙값, 단위 ms</strong>입니다. 각 실행에서 지연을 정렬한 뒤 <code class="notranslate">ceil(p × n)</code>번째 값을 골랐습니다. 전체 표본을 합친 분위수는 아니며, 이벤트 대상 40건의 p99는 해당 실행의 최대값입니다.</p>
+<h3>전체 주문의 p95만 보면 복구 경로가 가려진다</h3>
+<p>운영 당시 회고와 별도로 <strong>로컬 MySQL 8.4, Kafka 4.1.2 단일 브로커, 모의 PG HTTP</strong>에서 같은 구간을 비교했습니다. 실제 PG나 운영 환경의 측정값은 아닙니다. 같은 선전송과 일괄 기록 Relay에서 폴링만 바꿨습니다.</p>
+<p>목표 유입 20건/초로 200건씩 실행하고, 매 5번째 요청은 결제 커밋 뒤 HTTP 응답을 늦춰 이벤트로 반영되도록 했습니다. 실행당 40건이 이 경로에 의존했습니다. 다음은 <strong>3회 실행별 p95의 중앙값</strong>입니다.</p>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>결제 커밋 → 주문 DB 반영</th>
+<th align="right">5초 폴링</th>
+<th align="right">100ms 폴링</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>응답 지연 조건의 전체 200건</td>
+<td align="right">4,217.3ms</td>
+<td align="right">114.0ms</td>
+</tr>
+<tr>
+<td>그중 이벤트로 반영한 40건</td>
+<td align="right">5,241.0ms</td>
+<td align="right">202.1ms</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>개선 후 전체 주문 p95는 <strong>114.0ms</strong>, 이벤트 복구 경로는 <strong>202.1ms</strong>였습니다. HTTP가 먼저 반영하는 주문과 이벤트를 기다리는 주문은 다른 집단입니다. 전체 지표가 좋아도 복구 경로가 그만큼 빠르다는 뜻은 아닙니다. 이 경로의 p95는 반복별로 4,933.6–5,278.9ms에서 133.4–274.7ms로 줄었습니다.</p>
+<p>20ms마다 확인한 미반영 수의 최대치도 실행별 중앙값 <strong>21건 → 3건</strong>, 가장 오래 기다린 미반영 주문의 나이는 <strong>5,343.8ms → 195.3ms</strong>였습니다. 완료된 주문의 분위수와 지금 남아 있는 주문을 함께 봐야 했습니다.</p>
+<h3>기존 적체를 비우는 것과 유입을 따라잡는 것은 다르다</h3>
+<p>하지만 빈 상태에서 200건을 처리한 결과만으로 장애 후 복구를 판단할 수는 없습니다. 이번에는 <strong>결과와 Outbox가 이미 커밋된 300건</strong>을 준비하고, Relay를 시작한 뒤에도 목표 초당 20건으로 20초 동안 400건을 추가했습니다. HTTP로 먼저 반영하는 경로 없이 모두 이벤트를 통해 주문 DB에 적용했습니다.</p>
+<p>회차당 100건을 먼저 전송하고 결과를 일괄 기록하는 모델은 그대로 두고, 5초와 100ms를 번갈아 3회씩 실행했습니다. 아래 역시 실행별 값의 중앙값이며, 시간의 시작점은 초기 300건을 커밋한 뒤 Relay를 시작한 시점입니다.</p>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>초기 적체 300건 + 새 이벤트 400건</th>
+<th align="right">5초 폴링</th>
+<th align="right">100ms 폴링</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>초기 300건의 주문 반영 완료</td>
+<td align="right">15.37초</td>
+<td align="right">0.56초</td>
+</tr>
+<tr>
+<td>그때까지 커밋된 모든 결과를 처음 따라잡음</td>
+<td align="right">35.69초</td>
+<td align="right">0.68초</td>
+</tr>
+<tr>
+<td>새로 들어온 400건의 반영 p95</td>
+<td align="right">20,212.4ms</td>
+<td align="right">146.9ms</td>
+</tr>
+<tr>
+<td>시작 후 첫 1초에 들어온 20건의 반영 p95</td>
+<td align="right">20,267.0ms</td>
+<td align="right">516.3ms</td>
+</tr>
+<tr>
+<td>700건을 모두 반영할 때까지 조회 횟수</td>
+<td align="right">7회</td>
+<td align="right">159회</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>5초 폴링은 초기 300건을 처리한 뒤에도 새 이벤트가 계속 쌓여 있었습니다. 반면 100ms 폴링은 유입이 계속되는 동안 한 번 따라잡았습니다. <strong>처음 따라잡은 시점이 전체 작업의 종료는 아닙니다.</strong> 이후에도 새 이벤트는 약 20초까지 들어왔습니다. 마지막 유입 후 전체 반영까지는 각각 15.73초와 0.08초가 더 걸렸습니다.</p>
+<p>개선 후에도 전체 신규 이벤트 p95보다 시작 직후 20건의 p95가 컸습니다. 이 주문들은 초기 적체 뒤에서 기다렸기 때문입니다. 평상시와 복구 직후를 한 지표로 합치면 가장 불편했던 구간이 가려질 수 있습니다.</p>
+<p>폴링을 줄인 비용도 있습니다. 100ms는 다음 조회 전의 최소 대기이지 초당 10회 실행 보장이 아닙니다. 조회와 전송, 결과 기록 시간이 더해지며, 이 실행에서도 조회 횟수는 증가했습니다. <strong>DB CPU와 잠금 경합, 장기 최대 처리량까지 측정한 결과는 아닙니다.</strong></p>
+<p>Relay의 용량을 계산할 때는 발행 완료 기준의 지속 처리율을 <code class="notranslate">μ</code>(건/초), Outbox 신규 유입률을 <code class="notranslate">λ</code>(건/초), 그 시점의 미발행 적체를 <code class="notranslate">B</code>(건)로 맞춥니다. 일정한 속도와 <code class="notranslate">μ &gt; λ</code>를 가정한 해소 시간은 <code class="notranslate">B / (μ − λ)</code>로 근사할 수 있습니다. <code class="notranslate">μ ≤ λ</code>이면 유입이 계속되는 동안 따라잡지 못합니다. 기존 설정은 처리 시간이 0이어도 상한이 초당 20건이어서, 목표 유입 20건/초에서는 적체를 줄일 여유가 없었습니다. 이때는 배치를 한 번 비웠다는 사실보다 <strong>새 유입을 처리하고도 남는 처리율</strong>이 중요했습니다.</p>
+<p>여기서 <code class="notranslate">λ</code>는 HTTP 응답을 놓친 주문 수가 아니라 <strong>Outbox에 생성되는 전체 이벤트 수</strong>입니다. HTTP로 이미 주문을 반영했더라도 그 결제 결과 이벤트는 발행합니다. 복구 대상 40건만 보고 Relay 용량을 잡으면 이 조건에서는 실제 200건의 발행 수요를 다섯 배 적게 보게 됩니다.</p>
+<details>
+<summary>측정 경계, PG 조건별 결과와 검증 범위</summary>
+<p>동일 JVM의 <code class="notranslate">System.nanoTime()</code>으로 결제 커밋 완료 확인부터 주문 커밋 완료 확인까지를 기록했습니다. 별도 HTTP 서버와 독립된 DB TX를 사용했으며 판매자 화면 갱신과 수락 시간은 포함하지 않았습니다. 최초 폴링도 각 delay 뒤에 실행했습니다.</p>
+<p>HTTP 비교는 조건마다 200건씩 3회입니다. 다음은 <strong>실행별 p95 / p99의 중앙값, 단위 ms</strong>입니다. 각 실행에서 정렬 후 <code class="notranslate">ceil(p × n)</code>번째 값을 골랐으며 전체 표본을 합친 분위수가 아닙니다. 이벤트 대상 40건의 p99는 그 실행의 최대값입니다.</p>
 <markdown-accessiblity-table><table role="table">
 <thead>
 <tr>
@@ -191,44 +262,14 @@
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
-<p>응답 지연 조건에서는 매 5번째 요청의 결제 HTTP 응답을 결과 커밋 후 5초 늦춰 주문 서비스의 4초 타임아웃을 넘겼습니다. 실행당 200건 중 40건이 이벤트 반영 대상이었습니다. 이 대상의 반영 p95는 <strong>5,241.0ms → 202.1ms</strong>였습니다. 반복별 범위는 각각 4,933.6–5,278.9ms와 133.4–274.7ms입니다.</p>
-<p>여기서 전체 주문 p95인 <strong>114.0ms만 보면 이벤트 복구 경로의 p95 202.1ms를 읽을 수 없습니다.</strong> HTTP가 먼저 반영하는 주문과 이벤트를 기다리는 주문은 다른 집단입니다. 그 비율이 달라지면 전달 경로가 같아도 전체 지표가 달라집니다. 장애 복구 경로의 품질을 보려면 그 경로에 의존한 주문을 따로 봐야 합니다.</p>
-<p>PG 지연 조건은 모의 PG의 rolling 1초 호출이 9건을 넘으면 성공 응답을 3초 늦춘 조건입니다. 실제 나이스페이의 호출 한도나 지연 곡선이 아닙니다. 폴링을 줄여도 요청부터 반영까지 p95는 약 4.25초 남았습니다. <strong>Relay는 결제 확정 이후의 전달 대기를 줄일 뿐 PG 대기를 없애지는 않습니다.</strong> 정상 HTTP 경로의 작은 수치 차이도 폴링 변경만의 효과로 단정하지 않습니다.</p>
-<h3>완료된 주문과 아직 기다리는 주문을 나눠 본다</h3>
-<p>완료 주문의 분위수만으로는 지금 남아 있는 주문을 알 수 없습니다. 미반영 수와 가장 오래 기다린 시간도 함께 확인했습니다. 다음은 <strong>20ms 간격으로 관측한 실행별 최대치의 중앙값</strong>입니다.</p>
-<markdown-accessiblity-table><table role="table">
-<thead>
-<tr>
-<th>미반영 지표</th>
-<th align="right">5초 폴링</th>
-<th align="right">100ms 폴링</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>응답 지연: 최대 미반영 수</td>
-<td align="right">21건</td>
-<td align="right">3건</td>
-</tr>
-<tr>
-<td>응답 지연: 가장 오래 기다린 미반영 주문</td>
-<td align="right">5,343.8ms</td>
-<td align="right">195.3ms</td>
-</tr>
-<tr>
-<td>PG 지연: 최대 미반영 수</td>
-<td align="right">56건</td>
-<td align="right">5건</td>
-</tr>
-<tr>
-<td>PG 지연: 가장 오래 기다린 미반영 주문</td>
-<td align="right">5,183.6ms</td>
-<td align="right">269.6ms</td>
-</tr>
-</tbody>
-</table></markdown-accessiblity-table>
-<p>세 조건의 총 18회 3,600건은 종료 후 Kafka 기록과 결제 결과, Outbox와 주문 DB를 대조했고 최종 미반영은 모두 0건이었습니다. 종료 시점의 0건이 측정 중에도 항상 0건이었다는 뜻은 아닙니다. 샘플링 사이의 최대치, 장기 운영 누락률과 장애 내구성도 이 결과로 보장하지 않습니다.</p>
-<p>이 측정이 뒷받침하는 것은 <strong>폴링 주기 단축으로 이벤트 반영 경로의 대기를 줄였다는 것</strong>입니다. 다음 절의 콜백 전환이나 부분 환불, 다중 Relay의 검증 결과로 확대하지 않습니다. 판매자 화면 갱신과 실제 수락 시간도 포함하지 않았습니다.</p>
+<p>응답 지연 조건은 매 5번째 요청의 결제 HTTP 응답을 커밋 후 5초 늦춰 호출자의 4초 타임아웃을 넘겼습니다. PG 지연 조건은 모의 PG의 rolling 1초 호출이 9건을 넘으면 성공 응답을 3초 늦춘 조건입니다. 실제 나이스페이의 호출 한도나 지연 곡선이 아닙니다.</p>
+<p>폴링을 줄여도 PG 지연 조건의 요청부터 반영까지 p95는 약 4.25초 남았습니다. <strong>Relay는 확정 이후의 전달 대기를 줄이며 PG 대기를 없애지는 않습니다.</strong> 정상 HTTP 경로의 작은 차이도 폴링 변경만의 효과로 단정하지 않습니다.</p>
+<p>PG 지연 조건에서 20ms마다 확인한 최대 미반영 수의 실행별 중앙값은 56건 → 5건, 가장 오래 기다린 미반영 주문의 나이는 5,183.6ms → 269.6ms였습니다. 샘플링 사이의 최대치는 놓칠 수 있습니다.</p>
+<p>HTTP 비교의 총 18회 3,600건은 Kafka 기록과 결제 결과, Outbox와 주문 DB를 대조했고 최종 미반영은 모두 0건이었습니다. 종료 시점의 0건이 실행 중에도 항상 0건이었다는 뜻은 아닙니다.</p>
+<p>적체 비교는 같은 MySQL와 Kafka에서 PG와 HTTP를 제외한 별도 전달 모델입니다. 초기 적체 해소 시간은 초기 300건 중 마지막 주문 커밋에서, 신규 지연은 각 신규 결과 커밋에서 계산했습니다. 따라잡은 시점은 커밋과 적용 시각을 정렬해, 그 시각까지 커밋된 미반영 결과가 처음 0건이 된 때입니다. 슬롯 대기나 화면 갱신 시간의 추정값이 아닙니다.</p>
+<p>신규 커밋의 실제 첫 시각과 마지막 시각으로 계산한 유입률은 6회 모두 19.991–19.994건/초 범위였습니다. 총 4,200건의 고유 ID와 Kafka 기록, 승인 결과, PUBLISHED, 주문 적용 1회와 inbox를 대조했고 최종 미반영은 모두 0건이었습니다. 반복별 신규 p95는 기존 20,205.1–20,230.1ms, 변경 후 142.4–148.2ms였습니다.</p>
+<p>이 결과는 <strong>폴링 간격 변경의 전달 대기와 제한된 적체 해소 비교</strong>입니다. 다음 절의 콜백 구조나 실제 서비스의 부분 환불, 다중 Relay, 장기 운영 누락률의 검증으로 확대하지 않습니다.</p>
+</details>
 <h2 id="section-5">5. 느린 한 건이 다른 결제의 발행을 막지 않도록 해야 한다</h2>
 <p>앞 절에서 수치로 확인한 범위는 폴링 주기 변경입니다. 여기부터는 배치 대기를 없애기 위한 <strong>콜백 Relay의 설계 계약</strong>을 다룹니다. 코드는 구현에 필요한 실행 경계를 축약한 것이며, 이 모델의 성능 수치를 앞 절의 결과로 대신하지 않습니다.</p>
 <p>폴링 간격을 줄여도 배치 전체를 기다리는 구조는 남습니다. 기존 구현도 먼저 여러 <code class="notranslate">send()</code>를 시작했으므로 Kafka 전송이 한 건씩만 진행된 것은 아닙니다. <strong>이미 전달된 이벤트는 Consumer가 바로 반영할 수 있었습니다.</strong> 기다리는 것은 배치 뒤에 새로 쌓인 이벤트의 전송 시작이었습니다.</p>
@@ -362,12 +403,8 @@
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
-<p>재시도 관련 설정을 추리면 다음과 같습니다. <code class="notranslate">request.timeout.ms=2000</code>, <code class="notranslate">linger.ms=5</code>와 함께 사용해, <code class="notranslate">delivery.timeout.ms</code>가 두 값의 합보다 커야 하는 조건도 맞췄습니다.</p>
-<div class="highlight highlight-source-ini"><pre class="notranslate"><span class="pl-k">retry.backoff.ms</span>=100
-<span class="pl-k">retry.backoff.max.ms</span>=1000
-<span class="pl-k">delivery.timeout.ms</span>=30000
-<span class="pl-k">max.block.ms</span>=5000</pre></div>
-<p>이때 <strong>30초는 주문 반영의 목표 시간이 아니라, 장애 중 한 전송 시도에 허용하는 시간</strong>입니다. 정상 전송은 ACK를 받는 즉시 결과를 기록하고 슬롯을 반환합니다. 전송 타임아웃 뒤에도 Kafka에 기록됐을 가능성은 남으므로, 다시 발행할 때는 같은 eventId를 유지하고 Consumer가 중복을 막습니다. 설정 변경 후에는 재시도 건수뿐 아니라 처리 슬롯 점유, 가장 오래된 PENDING의 대기 시간, 주문 반영 지연을 함께 봤습니다. <a href="https://kafka.apache.org/41/configuration/producer-configs/" rel="nofollow">Kafka 프로듀서 설정</a></p>
+<p><code class="notranslate">request.timeout.ms=2000</code>, <code class="notranslate">linger.ms=5</code>와 함께 사용해 <code class="notranslate">delivery.timeout.ms</code>가 두 값의 합보다 커야 하는 조건도 맞췄습니다.</p>
+<p>이때 <strong>30초는 주문 반영의 목표 시간이 아니라, 장애 중 한 전송 시도에 허용하는 시간</strong>입니다. 정상 전송은 ACK를 받는 즉시 결과를 기록하고 슬롯을 반환합니다. 전송 타임아웃 뒤에도 Kafka에 기록됐을 가능성은 남으므로, 다시 발행할 때는 같은 eventId를 유지하고 Consumer가 중복을 막습니다. 설정 변경 시에는 재시도 건수뿐 아니라 처리 슬롯 점유, 가장 오래된 PENDING의 대기 시간, 주문 반영 지연을 함께 확인해야 합니다. <a href="https://kafka.apache.org/41/configuration/producer-configs/" rel="nofollow">Kafka 프로듀서 설정</a></p>
 <p>전송 시도가 최종 실패하면 Relay는 재시도 가능한 행의 <code class="notranslate">attempt_count</code>와 <code class="notranslate">next_attempt_at</code>을 결과 기록 TX에서 갱신합니다. 횟수는 Outbox의 새 전송 시도 기준이며 Kafka 내부 재시도 횟수와 다릅니다. BLOCKED는 잘못된 payload처럼 자동 재시도로 해결되지 않는 오류를 격리할 때 사용합니다. Kafka 장애나 단순 관측 타임아웃을 이유로 결제 결과 이벤트를 삭제하지 않습니다.</p>
 <p>기본 조회 조건은 <code class="notranslate">status = 'PENDING' AND next_attempt_at &lt;= CURRENT_TIMESTAMP(6)</code>이며, 현재 처리 중인 ID도 제외합니다. 신규 행은 생성 즉시 발행 대상이 되도록 초기 시각을 넣습니다. 다만 이 조건만으로는 같은 결제의 이벤트 순서를 지킬 수 없으므로, 선행 미발행 이벤트가 있는지도 함께 확인해야 합니다.</p>
 <p>백오프 정책 예시로 기본 간격을 1초, 2초, 4초처럼 늘리되 최대 30초로 제한하고, 각 간격의 50–100% 범위에서 무작위로 대기 시간을 정할 수 있습니다. 같은 시점에 실패한 이벤트가 함께 몰려 재전송되는 것을 줄이기 위한 jitter입니다. 이벤트마다 Relay 스레드를 재우지 않고 다음 시각을 DB에 남깁니다. DB 기록 실패의 재시도와 Kafka 발행 실패의 재시도는 구분합니다.</p>
@@ -464,7 +501,7 @@
 <p>주문 적용 시 orderId와 paymentId, paymentAttemptId, orderAdjustmentId의 연관 관계를 확인합니다. 같은 refundId의 재수신은 중복이지만 다른 부분 환불을 같은 작업으로 합치지 않습니다. 일부 메뉴만 취소됐다면 해당 수량과 환불액만 반영하고 나머지 조리와 제공은 유지합니다. 재고 복구는 금액으로 수량을 역산하지 않고 주문 변경의 대상 수량과 조리 상태, 예약 처리 이력으로 판단합니다. 조리 완료 후 금액 보상은 판매 가능한 수량 복구와 구분합니다.</p>
 </details>
 <h2 id="section-7">7. 관측하기</h2>
-<p>운영에서 확인할 기준은 <strong>결제가 끝난 주문이 어느 경계에 남아 있는가</strong>입니다. <code class="notranslate">orderId → paymentAttemptId → paymentId와 eventSequence → eventId</code>로 원거래와 전달, 적용 이력을 연결합니다. 백오피스도 이 구분을 드러내도록 구성합니다.</p>
+<p>운영에서 확인할 기준은 <strong>결제가 끝난 주문이 어느 경계에 남아 있는가</strong>입니다. <code class="notranslate">orderId → paymentAttemptId → paymentId와 eventSequence → eventId</code>로 원거래와 전달, 적용 이력을 연결합니다. 이 기준을 화면에서도 구분할 수 있도록 백오피스의 표시 항목을 설계했습니다.</p>
 <markdown-accessiblity-table><table role="table">
 <thead>
 <tr>
