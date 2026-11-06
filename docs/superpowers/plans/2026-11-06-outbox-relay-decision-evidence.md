@@ -66,3 +66,12 @@
 - [x] Replace unmeasured-resource wording with scoped results and replace user-facing 나이 with 대기 시간.
 
 Execution note: comparison27runs/12420events, recovery5freshchecks, resources12measuredruns/5520events all passed independent review. Initial resource warmup output-path failure was corrected and excluded. Public rendering validates7sections/8images/9details and all key numerical values. Deployment and live readback are recorded in the local publication verification artifact after push.
+
+### Task 5: Approved narrative compression
+
+- [x] Reframe the visible article as six steps: observed mismatch, durable intent, polling delay, callback choice, apply-once recovery, observability.
+- [x] Reduce visible prose from19147 to9887characters without changing measured values or claiming an incident cause that was not established.
+- [x] Preserve all8figures once and move full measurements, CPU/NMT scope, retry, CDC, ordering and partial refund contracts to collapsed supplements.
+- [ ] Independently review technical/evidence boundaries and rendered nested details, then republish at the same URL and verify public bytes.
+
+Compression review: no technical/evidence regression; fixed particle corruption 대기 시간는 and provider-name corruption caused by earlier broad replacement. Structural render and public byte readback are the publication gates.
