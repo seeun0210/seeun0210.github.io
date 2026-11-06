@@ -75,3 +75,12 @@ Execution note: comparison27runs/12420events, recovery5freshchecks, resources12m
 - [ ] Independently review technical/evidence boundaries and rendered nested details, then republish at the same URL and verify public bytes.
 
 Compression review: no technical/evidence regression; fixed particle corruption 대기 시간는 and provider-name corruption caused by earlier broad replacement. Structural render and public byte readback are the publication gates.
+
+### Task 6: Direct technical wording
+
+- [x] Scan main text, supplements, image descriptions and diagram labels for age/lifespan, catch-up, hidden-path, sleep and gap metaphors.
+- [x] Replace30phrase patterns with explicit waiting time, slot occupancy period, first zero unapplied count, event-processing waits and non-atomic storage descriptions. Keep every measured numeric value and occurrence unchanged; explanatory zero counts may increase.
+- [x] Update editable Excalidraw source and export only the AFTER_COMMIT figure, replacing 빈틈 with 커밋 후 발행 누락 가능. Shape/layout unchanged; rendered validation has no issues.
+- [x] Render and review wording diff, preserve measured numbers, validate local links, image dimensions and nested details.
+- [x] State that production uses Amazon MSK and the local comparison reproduces the same delivery structure; do not claim identical infrastructure.
+- [ ] Publish and confirm public HTML/Markdown/CSS/eightPNG bytes.

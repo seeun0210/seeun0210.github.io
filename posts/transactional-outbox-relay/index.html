@@ -6,15 +6,15 @@
 <p>필요한 것은 승인 API를 다시 호출하는 일이 아니었습니다. <strong>이미 확정된 결제 결과를 잃지 않고 주문에 반영하는 경로</strong>였습니다. 이 글에서는 그 경로에 Outbox를 도입한 이유와, 전달 지연을 줄이면서 콜백 Relay를 선택한 근거를 다룹니다.</p>
 <h2 id="section-1">1. 결제는 됐다는데, 주문은 어디 갔을까</h2>
 <p>처음에는 판매자 화면의 갱신 문제를 의심했습니다. 그런데 주문 조회 API에서도 해당 주문은 결제 대기였습니다. 화면을 새로고침해서 해결할 일이 아니었습니다.</p>
-<p>같은 주문번호로 APM과 요청 로그를 따라갔습니다. 결제 서비스에는 PG 승인 성공과 결제 결과 저장 기록이 있었지만, 주문 서비스에는 그 결과를 반영한 기록이 없었습니다. 여기서 확인한 것은 <strong>결제 결과와 주문 상태가 갈라졌다는 사실</strong>입니다. 이것만으로 HTTP 응답 유실인지, 이벤트 발행이나 적용 실패인지까지 확정할 수는 없었습니다.</p>
-<p>여러 축제의 여러 푸드트럭이 플랫폼을 사용하고 고객은 QR로 메뉴를 열어 주문합니다. 주문 서비스와 결제 서비스는 배포 단위가 분리돼 있습니다. 같은 MySQL 인스턴스를 사용하지만 각자 소유한 테이블과 독립적인 트랜잭션을 관리합니다. 결제 서비스는 승인과 취소, 환불뿐 아니라 판매자별 정산과 지급대행도 담당합니다.</p>
+<p>같은 주문번호로 APM과 요청 로그를 따라갔습니다. 결제 서비스에는 PG 승인 성공과 결제 결과 저장 기록이 있었지만, 주문 서비스에는 그 결과를 반영한 기록이 없었습니다. 여기서 확인한 것은 <strong>결제 결과와 주문 상태가 일치하지 않는다는 사실</strong>입니다. 이것만으로 HTTP 응답 유실인지, 이벤트 발행이나 적용 실패인지까지 확정할 수는 없었습니다.</p>
+<p>여러 축제의 여러 푸드트럭이 플랫폼을 사용하고 고객은 QR로 메뉴를 열어 주문합니다. 주문 서비스와 결제 서비스는 배포 단위가 분리돼 있습니다. 같은 MySQL 인스턴스를 사용하지만 각자 소유한 테이블과 독립적인 트랜잭션을 관리합니다. 결제 서비스는 승인과 취소, 환불뿐 아니라 판매자별 정산과 지급대행도 담당합니다. 운영의 Kafka 브로커는 Amazon MSK를 사용합니다.</p>
 <p><a target="_blank" rel="noopener noreferrer" href="/assets/posts/transactional-outbox-relay/01-00-architecture-without-db-label-v2.png"><img src="/assets/posts/transactional-outbox-relay/01-00-architecture-without-db-label-v2.png" alt="주문과 결제 처리 흐름과 각 트랜잭션 경계" style="max-width: 100%;" loading="lazy" decoding="async" width="2832" height="1632"></a></p>
 <p>정상 경로는 주문 서비스 → 결제 서비스 → PG의 동기 HTTP 호출입니다. 결제 결과가 돌아오면 주문 서비스가 자기 TX에서 <strong>결제 확인 후 판매자 수락 대기</strong>를 기록합니다. 이후 판매자가 수락하면 조리 중으로 넘어갑니다.</p>
-<p>결제 커밋 뒤 HTTP 응답을 놓치거나, 응답을 받은 주문 서비스가 DB에 기록하기 전에 종료되면 결제만 성공한 상태가 남을 수 있습니다. 같은 MySQL을 사용해도 두 서비스의 HTTP 호출이 하나의 로컬 TX로 묶이지는 않습니다. 따라서 타임아웃을 승인 실패로 바꾸지 않고 기존 <code class="notranslate">paymentAttemptId</code>의 결과부터 확인해야 했습니다.</p>
+<p>결제 커밋 뒤 HTTP 응답을 놓치거나, 응답을 받은 주문 서비스가 DB에 기록하기 전에 종료되면 결제만 성공한 상태가 남을 수 있습니다. 같은 MySQL을 사용해도 두 서비스의 처리가 하나의 로컬 TX에 포함되지는 않습니다. 따라서 타임아웃을 승인 실패로 바꾸지 않고 기존 <code class="notranslate">paymentAttemptId</code>의 결과부터 확인해야 했습니다.</p>
 <h2 id="section-2">2. 전달할 결제 결과를 DB에 남겼다</h2>
-<p>기존에는 <code class="notranslate">@TransactionalEventListener(AFTER_COMMIT)</code>에서 Kafka로 이벤트를 보냈습니다. DB 커밋이 끝난 뒤 실행되므로 롤백된 결과를 발행할 위험은 줄지만, <strong>커밋과 Kafka 기록 사이의 빈틈</strong>은 남습니다. <a href="https://docs.spring.io/spring-framework/reference/data-access/transaction/event.html" rel="nofollow">Spring의 트랜잭션 이벤트 실행 시점</a></p>
+<p>기존에는 <code class="notranslate">@TransactionalEventListener(AFTER_COMMIT)</code>에서 Kafka로 이벤트를 보냈습니다. DB 커밋이 끝난 뒤 실행되므로 롤백된 결과를 발행할 위험은 줄지만, <strong>DB 커밋과 Kafka 기록을 원자적으로 완료하는 것은 아닙니다.</strong> <a href="https://docs.spring.io/spring-framework/reference/data-access/transaction/event.html" rel="nofollow">Spring의 트랜잭션 이벤트 실행 시점</a></p>
 <p><a target="_blank" rel="noopener noreferrer" href="/assets/posts/transactional-outbox-relay/02-03-after-commit-gap.png"><img src="/assets/posts/transactional-outbox-relay/02-03-after-commit-gap.png" alt="AFTER_COMMIT의 유실 구간" style="max-width: 100%;" loading="lazy" decoding="async" width="2832" height="1012"></a></p>
-<p>커밋 후 리스너 실행 전이나, 비동기 send 등록 후 브로커 기록 전에 프로세스가 종료되면 재시작한 서버는 무엇을 보내려 했는지 모릅니다. <code class="notranslate">.get()</code>으로 ACK를 기다려도 이미 끝난 DB 커밋과 Kafka 전송이 원자적으로 묶이지는 않습니다. 반대로 커밋 전에 보내면 이벤트만 전달된 뒤 DB가 롤백될 수 있습니다.</p>
+<p>커밋 후 리스너 실행 전이나, 비동기 send 등록 후 브로커 기록 전에 프로세스가 종료되면 재시작 후 발행 대상을 식별할 기록이 없을 수 있습니다. <code class="notranslate">.get()</code>으로 ACK를 기다려도 이미 끝난 DB 커밋과 Kafka 전송이 하나의 원자적 작업으로 처리되지는 않습니다. 반대로 커밋 전에 보내면 이벤트만 전달된 뒤 DB가 롤백될 수 있습니다.</p>
 <p>그래서 <strong>승인 결과와 발행할 이벤트를 결제 서비스의 같은 로컬 TX에 저장</strong>하도록 경계를 정했습니다. PG 호출은 이 TX 밖에서 수행하고, 확인된 결과를 전달합니다. 핵심 저장 경계는 다음과 같습니다.</p>
 <div class="highlight highlight-source-java"><pre class="notranslate"><span class="pl-c1">@</span><span class="pl-c1">Transactional</span>
 <span class="pl-k">public</span> <span class="pl-smi">ConfirmedPaymentResult</span> <span class="pl-en">recordResult</span>(<span class="pl-smi">VerifiedPgResult</span> <span class="pl-s1">pgResult</span>) {
@@ -34,14 +34,14 @@
 }</pre></div>
 <p>같은 결제의 결과 반영은 동일한 결제 행을 잠그고, PG 결과 키와 <code class="notranslate">(payment_id, event_sequence)</code>에는 유일성 제약을 둡니다. 제약 충돌 시에는 실패한 TX를 롤백하고 새 TX에서 기존 결과를 읽어 같은 원거래와 금액인지 확인합니다. 위 코드는 그 바깥 재조회 경로를 생략했습니다.</p>
 <p><a target="_blank" rel="noopener noreferrer" href="/assets/posts/transactional-outbox-relay/03-04-atomic-outbox.png"><img src="/assets/posts/transactional-outbox-relay/03-04-atomic-outbox.png" alt="결제 결과와 Outbox의 원자적 저장" style="max-width: 100%;" loading="lazy" decoding="async" width="2832" height="1212"></a></p>
-<p>이제 결제 결과와 Outbox INSERT가 함께 커밋되거나 함께 롤백됩니다. Relay는 DB에 남은 PENDING을 다시 찾을 수 있습니다. Outbox를 별도 <code class="notranslate">REQUIRES_NEW</code>로 저장하거나 AFTER_COMMIT에서 INSERT하면 이 저장 경계가 다시 깨집니다. PG 승인 자체와 주문 상태 변경은 이 로컬 TX 밖에 있습니다.</p>
+<p>이제 결제 결과와 Outbox INSERT가 함께 커밋되거나 함께 롤백됩니다. Relay는 DB에 남은 PENDING을 다시 찾을 수 있습니다. Outbox를 별도 <code class="notranslate">REQUIRES_NEW</code>로 저장하거나 AFTER_COMMIT에서 INSERT하면 결제 결과와 Outbox가 같은 TX에서 커밋된다는 보장이 없어집니다. PG 승인 자체와 주문 상태 변경은 이 로컬 TX 밖에 있습니다.</p>
 <p>이벤트는 확정 순간의 <code class="notranslate">eventId</code>, 원주문과 결제 식별자, 결과 순번과 금액을 담아 저장합니다. Relay가 재발행할 때도 <strong>동일 ID와 payload</strong>를 사용합니다. 발행 시점의 현재 결제를 다시 직렬화하면, 승인 후 환불된 결제를 승인 사건의 내용으로 보내는 문제가 생길 수 있습니다.</p>
-<p>결제 서비스 안의 1분 주기 대사는 PG 결과가 미확정인 시도를 확인합니다. Outbox는 이미 확정된 결과의 후속 전달을 맡습니다. 도입 전에 누락된 이벤트에는 Outbox 행이 없으므로, 당시의 불변 확정 내역과 주문 적용 이력을 대조하는 별도 복구가 필요합니다. Outbox 도입만으로 과거 누락까지 채워지는 것은 아닙니다.</p>
+<p>결제 서비스 안의 1분 주기 대사는 PG 결과가 미확정인 시도를 확인합니다. Outbox는 이미 확정된 결과를 후속 처리에 전달하는 데 사용합니다. 도입 전에 누락된 이벤트에는 Outbox 행이 없으므로, 당시의 불변 확정 내역과 주문 적용 이력을 대조하는 별도 복구가 필요합니다. Outbox 도입만으로 과거에 누락된 이벤트가 자동 복구되는 것은 아닙니다.</p>
 <h2 id="section-3">3. 지연되어서 좋은 데이터는 없다.</h2>
 <p>Outbox에 결과를 남겨도 언제 전달될지는 별개의 문제였습니다. 주문이 몰릴 때는 결제 결과와 Outbox가 있는데도 판매자가 주문을 뒤늦게 확인하는 문제가 남았습니다. PG 승인이 늦은 것과 <strong>승인이 끝난 뒤 전달을 기다리는 것</strong>부터 구분했습니다.</p>
 <p>기존 Relay는 한 회차 최대 100건을 먼저 send한 뒤 모든 future를 공통 마감까지 수집하고, 결과를 한 번에 기록했습니다. <code class="notranslate">fixedDelay=5000</code>이므로 다음 조회는 <strong>회차 처리 시간 + 5초 뒤</strong>였습니다. 처리 시간이 0이어도 회차당 100건이면 초당 20건을 넘기기 어렵습니다. 이는 코드에서 계산한 상한이며 측정한 최대 처리량은 아닙니다. <a href="https://docs.spring.io/spring-framework/reference/integration/scheduling.html" rel="nofollow">Spring fixedDelay의 실행 기준</a></p>
-<p>먼저 폴링 사이의 빈 대기를 줄였습니다. 운영 당시 회고로 HTTP 반영을 놓친 주문의 결제 확정 후 반영 지연은 약 5초에서 약 200ms로 줄었습니다. 이 근사값을 평균이나 p95로 부르지는 않습니다. 아래는 별도로 정의한 구간을 로컬 모델에서 측정한 결과입니다.</p>
-<p>MySQL 8.4와 Kafka 4.1.2 단일 브로커에서, 같은 선전송과 일괄 기록 Relay의 fixedDelay만 5초와 100ms로 바꿨습니다. 같은 JVM의 단조 시계로 <strong>결제 커밋 완료 확인 → 주문 DB 커밋 완료 확인</strong>을 기록했습니다. 실제 PG와 판매자 화면 갱신 시간은 포함하지 않았습니다.</p>
+<p>먼저 폴링 주기로 생기는 대기 시간을 줄였습니다. 운영 당시 회고로 HTTP 반영을 놓친 주문의 결제 확정 후 반영 지연은 약 5초에서 약 200ms로 줄었습니다. 이 근사값을 평균이나 p95로 부르지는 않습니다. 아래는 별도로 정의한 구간을 로컬 모델에서 측정한 결과입니다.</p>
+<p>비교에서는 운영과 같은 <strong>MySQL Outbox → Kafka → 주문 DB 반영 구조</strong>를 로컬에 구성했습니다. 비교 환경은 MySQL 8.4와 Kafka 4.1.2 단일 브로커이며, 같은 선전송과 일괄 기록 Relay의 fixedDelay만 5초와 100ms로 바꿨습니다. 같은 JVM의 단조 시계로 <strong>결제 커밋 완료 확인 → 주문 DB 커밋 완료 확인</strong>을 기록했습니다. 실제 PG와 판매자 화면 갱신 시간은 포함하지 않았습니다.</p>
 <markdown-accessiblity-table><table role="table">
 <thead>
 <tr>
@@ -60,7 +60,7 @@
 </tr>
 <tr>
 <td>초기 적체 300건 + 신규 400건 지속 유입</td>
-<td>커밋된 결과를 처음 모두 따라잡은 시점</td>
+<td>현재까지 커밋된 결과의 미반영 수가 처음 0이 된 시점</td>
 <td align="right">35.69초</td>
 <td align="right">0.68초</td>
 </tr>
@@ -73,10 +73,10 @@
 </tbody>
 </table></markdown-accessiblity-table>
 <p>각 수치는 3회 실행별 값의 중앙값입니다. 첫 조건은 모의 PG HTTP와 목표 유입 20건/초, 두 번째는 PG와 HTTP 없이 목표 초당 20건으로 20초 동안 추가한 별도 비교입니다. 두 조건의 상세 수치는 접힌 측정 자료에 남겼습니다.</p>
-<p>초기 적체 조건에서 기존 300건 자체는 15.37초 만에 끝났지만 그동안 추가된 이벤트가 남아, 유입까지 따라잡은 시점은 35.69초였습니다. 변경 후에는 각각 0.56초와 0.68초였습니다. <strong>기존 적체를 비운 것과 새 유입을 따라잡은 것은 달랐습니다.</strong> 이후에도 약 20초까지 새 이벤트가 들어왔으므로 처음 따라잡은 시점이 전체 작업의 종료는 아닙니다.</p>
-<p>100ms가 모든 환경의 정답은 아닙니다. 적체 비교에서 전체 700건을 반영할 때까지 조회 횟수는 7회에서 159회로 늘었습니다. 폴링 조정은 전달 시작을 기다리는 시간을 줄인 선택이며, DB 조회 비용과 실제 유입을 감당할 처리 여유도 함께 봐야 했습니다.</p>
+<p>초기 적체 조건에서 기존 300건의 반영은 15.37초에 끝났지만, 그동안 추가된 이벤트 중 미반영 결과가 남아 있었습니다. 미반영 수가 처음 0이 된 시점은 35.69초였고, 변경 후에는 두 시점이 각각 0.56초와 0.68초였습니다. <strong>초기 이벤트의 반영 완료와 신규 유입을 포함한 미반영 수 0은 서로 다른 지표입니다.</strong> 이후에도 약 20초까지 새 이벤트가 들어왔으므로, 미반영 수가 처음 0이 된 시점은 전체 작업 종료 시점과 다릅니다.</p>
+<p>100ms가 모든 환경의 정답은 아닙니다. 적체 비교에서 전체 700건을 반영할 때까지 조회 횟수는 7회에서 159회로 늘었습니다. 폴링 조정은 전달 시작을 기다리는 시간을 줄인 선택이며, DB 조회 비용과 신규 유입률을 초과하는 처리율도 함께 확인해야 했습니다.</p>
 <h2 id="section-4">4. 배치 전체를 기다리지 않는 콜백 Relay를 선택했다</h2>
-<p>폴링을 줄여도 느린 한 건 때문에 회차 전체가 반환하지 못하는 구조는 남았습니다. 기존에도 여러 send가 진행됐으므로 이미 Kafka에 도착한 이벤트는 Consumer가 반영할 수 있었습니다. 막힌 것은 <strong>뒤에 새로 쌓인 이벤트의 전송 시작</strong>이었습니다.</p>
+<p>폴링을 줄여도 느린 한 건 때문에 회차 전체가 반환하지 못하는 구조는 남았습니다. 기존에도 여러 send가 진행됐으므로 이미 Kafka에 도착한 이벤트는 Consumer가 반영할 수 있었습니다. 이전 회차가 끝날 때까지 <strong>새로 저장된 이벤트의 전송 시작이 지연</strong>됐습니다.</p>
 <p>이를 확인하려고 폴링 100ms, 미완료 한도 16건, 결과 DB 연결 4개를 맞춰 세 구성을 비교했습니다. 초기 160건에 신규 300건을 목표 초당 100건으로 추가하는 로컬 승인 모델입니다. 이 비교에는 PG와 HTTP가 없으며, Spring 서비스 전체를 실행한 결과는 아닙니다.</p>
 <markdown-accessiblity-table><table role="table">
 <thead>
@@ -104,12 +104,12 @@
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
-<p>지연은 실제 결과 TX 안의 <code class="notranslate">SELECT SLEEP(1)</code>로 만들었습니다. 수치는 실행별 p95의 3회 중앙값입니다. 배치 방식의 첫 이벤트는 약 120.2ms에 이미 주문에 반영됐지만, 17번째 이벤트의 send 시작은 1,233.9ms였습니다. 작업자는 208.8ms, 콜백은 211.4ms였습니다. <strong>콜백이 도착한 주문의 처리를 앞당긴 것이 아니라, 다음 발행이 이전 배치에 묶이지 않도록 한 효과</strong>였습니다.</p>
+<p>지연은 실제 결과 TX 안의 <code class="notranslate">SELECT SLEEP(1)</code>로 만들었습니다. 수치는 실행별 p95의 3회 중앙값입니다. 배치 방식의 첫 이벤트는 약 120.2ms에 이미 주문에 반영됐지만, 17번째 이벤트의 send 시작은 1,233.9ms였습니다. 작업자는 208.8ms, 콜백은 211.4ms였습니다. 이 차이는 <strong>이전 회차가 끝나기 전에 다음 이벤트의 전송을 시작할 수 있도록 한 결과</strong>였습니다.</p>
 <p>추가 지연이 없는 조건과 브로커 응답 경로에 40ms를 넣은 조건도 비교했습니다. 작업자와 콜백의 성능은 비슷했고 순위도 지표에 따라 바뀌었습니다. <code class="notranslate">.get()</code>을 없앴다는 사실만으로 더 빨라진다고 주장할 결과는 아니었습니다. 배치와의 비교에는 결과 커밋 단위 변경도 포함되므로 그 효과를 분리해서 해석해야 합니다.</p>
-<p>그중 콜백을 선택한 이유는 <strong>비동기 send의 완료 흐름을 유지하면서 ACK 대기용 작업자 스레드를 별도로 점유하지 않기 위해서</strong>입니다. 별도 자원 비교에서는 필요한 풀만 생성했고, JVM 스레드 수는 작업자 29개와 콜백 17개, NMT 스택 예약 공간은 55.8MiB와 49.7MiB였습니다. 이 스택 수치를 물리 메모리 절감량으로 읽지는 않습니다.</p>
+<p>그중 콜백을 선택한 이유는 <strong>비동기 send의 완료 흐름을 유지하면서 ACK 대기용 작업자 스레드를 별도로 점유하지 않기 위해서</strong>입니다. 별도 자원 비교에서는 필요한 풀만 생성했고, JVM 스레드 수는 작업자 29개와 콜백 17개, NMT 스택 예약 공간은 55.8MiB와 49.7MiB였습니다. 이 스택 예약 메모리 감소량이 실제 상주 메모리 감소량을 의미하지는 않습니다.</p>
 <p>CPU 시간은 정상 조건에서 876.8ms와 781.7ms였지만 응답 지연 조건에서는 880.7ms와 946.7ms로 순서가 바뀌었습니다. <strong>스레드와 스택 공간의 차이는 확인했지만 CPU 우위는 일관되지 않았습니다.</strong> 이 측정은 같은 JVM에서 실행한 source와 Consumer, Kafka client, JIT와 GC를 포함하며 Relay 전용 CPU가 아닙니다.</p>
 <p><a target="_blank" rel="noopener noreferrer" href="/assets/posts/transactional-outbox-relay/04-05-relay-flow.png"><img src="/assets/posts/transactional-outbox-relay/04-05-relay-flow.png" alt="처리 슬롯 안에서 조회와 전송하고 완료 콜백으로 결과 기록" style="max-width: 100%;" loading="lazy" decoding="async" width="3032" height="1552"></a></p>
-<p>스케줄러는 조회와 전송 등록 뒤 반환합니다. 다음 회차는 빈 슬롯만큼 새 이벤트를 맡습니다. 다음 코드는 실행 경계를 설명하며 오류 회수 구현 전체를 담지는 않습니다.</p>
+<p>스케줄러는 조회와 전송 등록 뒤 반환합니다. 다음 회차에서는 사용 가능한 슬롯 수만큼 새 이벤트를 처리합니다. 다음 코드는 실행 경계를 설명하며 오류 회수 구현 전체를 담지는 않습니다.</p>
 <div class="highlight highlight-source-java"><pre class="notranslate"><span class="pl-c1">@</span><span class="pl-c1">Scheduled</span>(<span class="pl-s1">fixedDelayString</span> = <span class="pl-s">"${outbox.relay.poll-delay-ms:100}"</span>)
 <span class="pl-k">public</span> <span class="pl-smi">void</span> <span class="pl-en">relayOnce</span>() {
     <span class="pl-smi">int</span> <span class="pl-s1">free</span> = <span class="pl-s1">inFlight</span>.<span class="pl-en">remainingCapacity</span>();
@@ -190,7 +190,7 @@
 </details>
 <details>
 <summary>HTTP와 모의 PG 조건별 전체 결과와 측정 경계</summary>
-<h3>전체 주문의 p95만 보면 복구 경로가 가려진다</h3>
+<h3>전체 주문의 p95만으로 이벤트 반영 지연을 평가할 수 없다</h3>
 <p>운영 당시 회고와 별도로 <strong>로컬 MySQL 8.4, Kafka 4.1.2 단일 브로커, 모의 PG HTTP</strong>에서 같은 구간을 비교했습니다. 실제 PG나 운영 환경의 측정값은 아닙니다. 같은 선전송과 일괄 기록 Relay에서 폴링만 바꿨습니다.</p>
 <p>목표 유입 20건/초로 200건씩 실행하고, 매 5번째 요청은 결제 커밋 뒤 HTTP 응답을 늦춰 이벤트로 반영되도록 했습니다. 실행당 40건이 이 경로에 의존했습니다. 다음은 <strong>3회 실행별 p95의 중앙값</strong>입니다.</p>
 <markdown-accessiblity-table><table role="table">
@@ -258,13 +258,13 @@
 <p>폴링을 줄여도 PG 지연 조건의 요청부터 반영까지 p95는 약 4.25초 남았습니다. <strong>Relay는 확정 이후의 전달 대기를 줄이며 PG 대기를 없애지는 않습니다.</strong> 정상 HTTP 경로의 작은 차이도 폴링 변경만의 효과로 단정하지 않습니다.</p>
 <p>PG 지연 조건에서 20ms마다 확인한 최대 미반영 수의 실행별 중앙값은 56건 → 5건, 가장 오래 기다린 미반영 주문의 대기 시간은 5,183.6ms → 269.6ms였습니다. 샘플링 사이의 최대치는 놓칠 수 있습니다.</p>
 <p>HTTP 비교의 총 18회 3,600건은 Kafka 기록과 결제 결과, Outbox와 주문 DB를 대조했고 최종 미반영은 모두 0건이었습니다. 종료 시점의 0건이 실행 중에도 항상 0건이었다는 뜻은 아닙니다.</p>
-<p>적체 비교는 같은 MySQL와 Kafka에서 PG와 HTTP를 제외한 별도 전달 모델입니다. 초기 적체 해소 시간은 초기 300건 중 마지막 주문 커밋에서, 신규 지연은 각 신규 결과 커밋에서 계산했습니다. 따라잡은 시점은 커밋과 적용 시각을 정렬해, 그 시각까지 커밋된 미반영 결과가 처음 0건이 된 때입니다. 슬롯 대기나 화면 갱신 시간의 추정값이 아닙니다.</p>
+<p>적체 비교는 같은 MySQL와 Kafka에서 PG와 HTTP를 제외한 별도 전달 모델입니다. 초기 적체 해소 시간은 초기 300건 중 마지막 주문 커밋에서, 신규 지연은 각 신규 결과 커밋에서 계산했습니다. 미반영 수가 처음 0이 된 시점은 각 결과의 커밋 시각과 주문 적용 시각을 정렬해 계산했습니다. 슬롯 대기나 화면 갱신 시간의 추정값이 아닙니다.</p>
 <p>신규 커밋의 실제 첫 시각과 마지막 시각으로 계산한 유입률은 6회 모두 19.991–19.994건/초 범위였습니다. 총 4,200건의 고유 ID와 Kafka 기록, 승인 결과, PUBLISHED, 주문 적용 1회와 inbox를 대조했고 최종 미반영은 모두 0건이었습니다. 반복별 신규 p95는 기존 20,205.1–20,230.1ms, 변경 후 142.4–148.2ms였습니다.</p>
 <p>이 결과는 <strong>폴링 간격 변경의 전달 대기와 제한된 적체 해소 비교</strong>입니다. Relay 구성 비교는 폴링을 100ms로 고정한 별도 모델입니다. 실제 서비스의 부분 환불이나 다중 Relay, 장기 운영 누락률을 검증한 결과는 아닙니다.</p>
 </details>
 <details>
-<summary>초기 적체와 지속 유입: 전체 결과와 처리 여유</summary>
-<h3>기존 적체를 비우는 것과 유입을 따라잡는 것은 다르다</h3>
+<summary>초기 적체와 지속 유입: 전체 결과와 추가 처리율</summary>
+<h3>초기 이벤트의 반영 완료와 미반영 수 0은 다르다</h3>
 <p>하지만 빈 상태에서 200건을 처리한 결과만으로 장애 후 복구를 판단할 수는 없습니다. 이번에는 <strong>결과와 Outbox가 이미 커밋된 300건</strong>을 준비하고, Relay를 시작한 뒤에도 목표 초당 20건으로 20초 동안 400건을 추가했습니다. HTTP로 먼저 반영하는 경로 없이 모두 이벤트를 통해 주문 DB에 적용했습니다.</p>
 <p>회차당 100건을 먼저 전송하고 결과를 일괄 기록하는 모델은 그대로 두고, 5초와 100ms를 번갈아 3회씩 실행했습니다. 아래 역시 실행별 값의 중앙값이며, 시간의 시작점은 초기 300건을 커밋한 뒤 Relay를 시작한 시점입니다.</p>
 <markdown-accessiblity-table><table role="table">
@@ -282,7 +282,7 @@
 <td align="right">0.56초</td>
 </tr>
 <tr>
-<td>그때까지 커밋된 모든 결과를 처음 따라잡음</td>
+<td>그 시점까지 커밋된 결과의 미반영 수가 처음 0이 됨</td>
 <td align="right">35.69초</td>
 <td align="right">0.68초</td>
 </tr>
@@ -303,10 +303,10 @@
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
-<p>5초 폴링은 초기 300건을 처리한 뒤에도 새 이벤트가 계속 쌓여 있었습니다. 반면 100ms 폴링은 유입이 계속되는 동안 한 번 따라잡았습니다. <strong>처음 따라잡은 시점이 전체 작업의 종료는 아닙니다.</strong> 이후에도 새 이벤트는 약 20초까지 들어왔습니다. 마지막 유입 후 전체 반영까지는 각각 15.73초와 0.08초가 더 걸렸습니다.</p>
-<p>개선 후에도 전체 신규 이벤트 p95보다 시작 직후 20건의 p95가 컸습니다. 이 주문들은 초기 적체 뒤에서 기다렸기 때문입니다. 평상시와 복구 직후를 한 지표로 합치면 가장 불편했던 구간이 가려질 수 있습니다.</p>
+<p>5초 폴링은 초기 300건을 처리한 뒤에도 새로 유입된 미반영 이벤트가 남아 있었습니다. 100ms 폴링은 신규 이벤트가 계속 유입되는 동안 미반영 수가 0이 된 시점이 있었습니다. <strong>미반영 수가 처음 0이 된 시점은 전체 작업 종료 시점과 다릅니다.</strong> 이후에도 약 20초까지 새 이벤트가 들어왔고, 마지막 유입 후 전체 반영까지는 각각 15.73초와 0.08초가 더 걸렸습니다.</p>
+<p>개선 후에도 전체 신규 이벤트 p95보다 시작 직후 20건의 p95가 컸습니다. 이 주문들은 초기 적체 뒤에서 기다렸기 때문입니다. 평상시와 복구 직후의 결과를 합쳐 계산하면 초기 유입 이벤트의 긴 지연을 확인하기 어렵습니다.</p>
 <p>폴링을 줄인 비용도 있습니다. 100ms는 다음 조회 전의 최소 대기이지 초당 10회 실행 보장이 아닙니다. 조회와 전송, 결과 기록 시간이 더해지며, 이 실행에서도 조회 횟수는 증가했습니다. <strong>DB CPU와 잠금 경합, 장기 최대 처리량까지 측정한 결과는 아닙니다.</strong></p>
-<p>Relay의 용량을 계산할 때는 발행 완료 기준의 지속 처리율을 <code class="notranslate">μ</code>(건/초), Outbox 신규 유입률을 <code class="notranslate">λ</code>(건/초), 그 시점의 미발행 적체를 <code class="notranslate">B</code>(건)로 맞춥니다. 일정한 속도와 <code class="notranslate">μ &gt; λ</code>를 가정한 해소 시간은 <code class="notranslate">B / (μ − λ)</code>로 근사할 수 있습니다. <code class="notranslate">μ ≤ λ</code>이면 유입이 계속되는 동안 따라잡지 못합니다. 기존 설정은 처리 시간이 0이어도 상한이 초당 20건이어서, 목표 유입 20건/초에서는 적체를 줄일 여유가 없었습니다. 이때는 배치를 한 번 비웠다는 사실보다 <strong>새 유입을 처리하고도 남는 처리율</strong>이 중요했습니다.</p>
+<p>Relay의 용량을 계산할 때는 발행 완료 기준의 지속 처리율을 <code class="notranslate">μ</code>(건/초), Outbox 신규 유입률을 <code class="notranslate">λ</code>(건/초), 그 시점의 미발행 적체를 <code class="notranslate">B</code>(건)로 맞춥니다. 일정한 속도와 <code class="notranslate">μ &gt; λ</code>를 가정한 해소 시간은 <code class="notranslate">B / (μ − λ)</code>로 근사할 수 있습니다. <code class="notranslate">μ ≤ λ</code>이면 신규 유입이 계속되는 동안 적체를 해소할 수 없습니다. 기존 설정은 처리 시간이 0이어도 상한이 초당 20건이어서, 목표 유입 20건/초에서는 신규 유입을 처리한 뒤 적체를 줄일 추가 처리율이 없었습니다. 이때는 한 배치의 처리 완료와 별개로 <strong>신규 유입률을 초과하는 처리율</strong>이 필요했습니다.</p>
 <p>여기서 <code class="notranslate">λ</code>는 HTTP 응답을 놓친 주문 수가 아니라 <strong>Outbox에 생성되는 전체 이벤트 수</strong>입니다. HTTP로 이미 주문을 반영했더라도 그 결제 결과 이벤트는 발행합니다. 복구 대상 40건만 보고 Relay 용량을 잡으면 이 조건에서는 실제 200건의 발행 수요를 다섯 배 적게 보게 됩니다.</p>
 </details>
 <details>
@@ -343,7 +343,7 @@
 </tbody>
 </table></markdown-accessiblity-table>
 <p>작업자와 콜백의 순위는 조건과 지표에 따라 조금씩 바뀌었습니다. <strong>이 결과로 콜백의 처리량 우위를 주장하지는 않습니다.</strong> 확인한 것은 배치 전체 대기를 제거한 두 구성이 비슷한 성능을 냈다는 점입니다.</p>
-<p>한 건의 DB 기록을 늦춘 조건에서 차이가 생긴 위치도 확인했습니다. 배치 방식의 첫 이벤트는 시작 후 약 <strong>120.2ms에 주문에 반영</strong>됐습니다. 하지만 그 결과를 기록하는 TX가 1초 지연되면서 17번째 이벤트의 send 시작은 <strong>1,233.9ms</strong>였습니다. 같은 이벤트의 시작은 작업자 방식 <strong>208.8ms</strong>, 콜백 <strong>211.4ms</strong>였습니다. 각 실행의 시각을 비교한 중앙값입니다. 이미 도착한 주문을 콜백이 더 빨리 보이게 한 것이 아니라, <strong>다음 이벤트가 이전 배치의 완료를 기다리지 않게 한 것</strong>입니다.</p>
+<p>한 건의 DB 기록을 늦춘 조건에서 차이가 생긴 위치도 확인했습니다. 배치 방식의 첫 이벤트는 시작 후 약 <strong>120.2ms에 주문에 반영</strong>됐습니다. 하지만 그 결과를 기록하는 TX가 1초 지연되면서 17번째 이벤트의 send 시작은 <strong>1,233.9ms</strong>였습니다. 같은 이벤트의 시작은 작업자 방식 <strong>208.8ms</strong>, 콜백 <strong>211.4ms</strong>였습니다. 각 실행의 시각을 비교한 중앙값입니다. 이 차이는 <strong>이전 회차가 끝나기 전에 다음 이벤트의 전송을 시작할 수 있도록 한 결과</strong>입니다.</p>
 <p>여기에는 비용도 있습니다. 실행당 460건을 처리할 때 배치 방식의 결과 커밋은 <strong>29회</strong>, 나머지 두 방식은 <strong>460회</strong>였습니다. 전송 완료 수집과 결과 기록 단위를 함께 바꾼 전체 구조 비교이며, <code class="notranslate">.get()</code>과 콜백 API만 바꾼 비교가 아닙니다. 커밋 횟수로 DB CPU나 커밋 소요 시간까지 추정하지 않습니다.</p>
 <p>Kafka client와 broker 4.1.2, MySQL 8.4 단일 인스턴스, broker 1개와 partition 3개, 결과 연결 풀 4개를 사용했습니다. PG와 HTTP를 제외한 전달 경로 비교입니다. 이벤트에는 원주문과 결제, 시도, 결과 순번과 금액을 넣고, key는 paymentId로 보냈습니다. 모든 이벤트는 서로 다른 결제의 승인 결과이며, 같은 결제의 후속 환불 순서까지 실행한 것은 아닙니다.</p>
 <p>초기 160건의 결과와 Outbox를 커밋한 뒤 시작했습니다. 신규 300건은 목표 10ms 간격으로 추가하고, 같은 JVM의 단조 시계로 결제 커밋 반환부터 주문 TX 커밋 반환까지 기록했습니다. Consumer는 적용 이력과 주문 변경을 같은 TX에 저장한 뒤 offset을 커밋했습니다. 신규 300건의 nearest-rank 분위수를 실행별로 계산했습니다.</p>
@@ -423,7 +423,7 @@
 </tr>
 </tbody>
 </table></markdown-accessiblity-table>
-<p>콜백에서 JVM 스레드는 <strong>12개</strong>, NMT의 스택 예약 공간은 약 <strong>6.1MiB</strong> 적었습니다. 하지만 스택 예약과 커밋은 OS가 실제 상주시킨 메모리인 RSS와 다릅니다. 이 환경에서 두 NMT 값은 같게 보고됐으며, 그 차이를 그대로 물리 메모리 절감량으로 읽지 않습니다.</p>
+<p>콜백에서 JVM 스레드는 <strong>12개</strong>, NMT의 스택 예약 공간은 약 <strong>6.1MiB</strong> 적었습니다. 하지만 스택 예약과 커밋은 OS가 실제 상주시킨 메모리인 RSS와 다릅니다. 이 환경에서 두 NMT 값은 같게 보고됐으며, 그 차이가 실제 상주 메모리 감소량을 의미하지는 않습니다.</p>
 <p>CPU 시간도 콜백이 항상 작지는 않았습니다. 추가 지연 없는 조건의 반복 범위는 작업자 850.8–966.1ms와 콜백 766.2–943.6ms였고, 브로커 응답 지연 조건에서는 각각 732.0–881.7ms와 776.2–986.9ms였습니다. <strong>두 조건 모두 범위가 겹쳤습니다.</strong> 이 표본에서는 ACK 대기 스레드와 스택 공간의 차이가 분명했고, CPU 효율이나 전체 RSS의 일관된 우위까지 입증한 것은 아닙니다.</p>
 <p>Java 21에서 <code class="notranslate">-Xms128m -Xmx384m -Xss512k -XX:NativeMemoryTracking=summary</code>를 동일하게 적용했습니다. 각 실행을 새 JVM으로 시작하고 132건을 워밍업한 뒤, 초기 160건과 신규 300건을 처리하는 12회만 집계했습니다. 방식의 실행 순서는 반복마다 교대했습니다. 총 5,520건의 Kafka 기록과 DB 최종 상태를 확인했습니다.</p>
 <p><code class="notranslate">ThreadMXBean</code>으로 전체 JVM 스레드 수를, <code class="notranslate">jcmd VM.native_memory summary</code>의 Thread 하위 stack으로 예약과 커밋 메모리를, OS의 <code class="notranslate">ps</code> RSS로 프로세스 상주 메모리를 읽었습니다. stack은 Thread 합계의 일부이므로 둘을 더하지 않았습니다. 이 값은 Java heap이나 작업자 스레드만의 메모리도 아닙니다. NMT는 JVM 내부 메모리 추적이며 프로세스 전체 RSS를 대신하지 않습니다. <a href="https://docs.oracle.com/en/java/javase/21/vm/native-memory-tracking.html" rel="nofollow">Java Native Memory Tracking</a></p>
@@ -445,8 +445,8 @@
 }, <span class="pl-s1">resultExecutor</span>);
 <span class="pl-s1">completionTracker</span>.<span class="pl-en">watch</span>(<span class="pl-s1">event</span>, <span class="pl-s1">sendFuture</span>, <span class="pl-s1">recordFuture</span>);</pre></div>
 <p>DB 작업을 Kafka 전송 완료 스레드에서 실행하지 않도록 명시적인 <code class="notranslate">resultExecutor</code>를 사용합니다. 원본 future와 결과 기록 future는 따로 추적합니다. 후속 future는 원래 전송 오류도 유지하므로, 예외 완료만으로 DB 기록 실패라고 판정할 수 없습니다. <strong>send의 동기 예외와 실행기 작업 거부도 completionTracker가 회수하는 경로</strong>가 필요합니다. 위 코드는 이 복구 구현을 생략한 연결 구조입니다. <a href="https://docs.spring.io/spring-kafka/reference/kafka/sending-messages.html" rel="nofollow">Spring Kafka의 비동기 전송 결과</a></p>
-<p><a target="_blank" rel="noopener noreferrer" href="/assets/posts/transactional-outbox-relay/05-11-callback-slot-lifecycle.png"><img src="/assets/posts/transactional-outbox-relay/05-11-callback-slot-lifecycle.png" alt="스케줄러와 Kafka 완료 스레드, DB 작업 실행기 사이의 슬롯 수명" style="max-width: 100%;" loading="lazy" decoding="async" width="3032" height="1992"></a></p>
-<p>ACK를 받았더라도 DB 기록 전에는 슬롯을 돌려주지 않습니다. 기록 실패 시 슬롯을 먼저 반환하면 같은 PENDING을 다시 읽을 수 있기 때문입니다. 메모리에 전송 결과를 보존하고 DB 기록만 재시도합니다. 재시도 가능한 전송 실패는 다음 발행 시각을 DB에 커밋한 뒤 슬롯을 반환합니다.</p>
+<p><a target="_blank" rel="noopener noreferrer" href="/assets/posts/transactional-outbox-relay/05-11-callback-slot-lifecycle.png"><img src="/assets/posts/transactional-outbox-relay/05-11-callback-slot-lifecycle.png" alt="스케줄러와 Kafka 완료 스레드, DB 작업 실행기 사이의 슬롯 점유 기간" style="max-width: 100%;" loading="lazy" decoding="async" width="3032" height="1992"></a></p>
+<p>ACK를 받았더라도 DB 기록 전에는 슬롯을 반환하지 않습니다. 기록 실패 시 슬롯을 먼저 반환하면 같은 PENDING을 다시 읽을 수 있기 때문입니다. 메모리에 전송 결과를 보존하고 DB 기록만 재시도합니다. 재시도 가능한 전송 실패는 다음 발행 시각을 DB에 커밋한 뒤 슬롯을 반환합니다.</p>
 <p>이 선택에는 비용도 있습니다. 배치당 한 번이던 결과 커밋이 건별로 나뉘고, 결과 실행기와 재시도 작업을 관리해야 합니다. 큐와 DB 연결 수도 제한해야 합니다. 배치 ACK 대기가 메서드 반환에서 빠져도, <strong>DB 기록이 느리면 슬롯 반환이 늦어져 다음 전송 역시 제한</strong>됩니다.</p>
 <p><a target="_blank" rel="noopener noreferrer" href="/assets/posts/transactional-outbox-relay/06-12-callback-recovery-shutdown.png"><img src="/assets/posts/transactional-outbox-relay/06-12-callback-recovery-shutdown.png" alt="실패 단계별 복구 경로와 정상 종료 순서" style="max-width: 100%;" loading="lazy" decoding="async" width="3032" height="2132"></a></p>
 <p>종료 순서는 신규 조회와 전송 중지 → 진행 중 전송과 후속 DB 기록 대기 → 결과 실행기 종료입니다. 실행기를 먼저 닫으면 뒤늦게 도착한 ACK를 기록할 곳이 없어집니다. <code class="notranslate">producer.flush()</code>만으로 외부 DB 작업 완료를 판단하지 않습니다. 유예 시간 안에 끝나지 않은 행은 DB에 남겨 다음 프로세스가 같은 ID로 재발행할 수 있어야 합니다.</p>
@@ -523,13 +523,13 @@
 <p>이때 <strong>30초는 주문 반영의 목표 시간이 아니라, 장애 중 한 전송 시도에 허용하는 시간</strong>입니다. 정상 전송은 ACK를 받는 즉시 결과를 기록하고 슬롯을 반환합니다. 전송 타임아웃 뒤에도 Kafka에 기록됐을 가능성은 남으므로, 다시 발행할 때는 같은 eventId를 유지하고 Consumer가 중복을 막습니다. 설정 변경 시에는 재시도 건수뿐 아니라 처리 슬롯 점유, 가장 오래된 PENDING의 대기 시간, 주문 반영 지연을 함께 확인해야 합니다. <a href="https://kafka.apache.org/41/configuration/producer-configs/" rel="nofollow">Kafka 프로듀서 설정</a></p>
 <p>전송 시도가 최종 실패하면 Relay는 재시도 가능한 행의 <code class="notranslate">attempt_count</code>와 <code class="notranslate">next_attempt_at</code>을 결과 기록 TX에서 갱신합니다. 횟수는 Outbox의 새 전송 시도 기준이며 Kafka 내부 재시도 횟수와 다릅니다. BLOCKED는 잘못된 payload처럼 자동 재시도로 해결되지 않는 오류를 격리할 때 사용합니다. Kafka 장애나 단순 관측 타임아웃을 이유로 결제 결과 이벤트를 삭제하지 않습니다.</p>
 <p>기본 조회 조건은 <code class="notranslate">status = 'PENDING' AND next_attempt_at &lt;= CURRENT_TIMESTAMP(6)</code>이며, 현재 처리 중인 ID도 제외합니다. 신규 행은 생성 즉시 발행 대상이 되도록 초기 시각을 넣습니다. 다만 이 조건만으로는 같은 결제의 이벤트 순서를 지킬 수 없으므로, 선행 미발행 이벤트가 있는지도 함께 확인해야 합니다.</p>
-<p>백오프 정책 예시로 기본 간격을 1초, 2초, 4초처럼 늘리되 최대 30초로 제한하고, 각 간격의 50–100% 범위에서 무작위로 대기 시간을 정할 수 있습니다. 같은 시점에 실패한 이벤트가 함께 몰려 재전송되는 것을 줄이기 위한 jitter입니다. 이벤트마다 Relay 스레드를 재우지 않고 다음 시각을 DB에 남깁니다. DB 기록 실패의 재시도와 Kafka 발행 실패의 재시도는 구분합니다.</p>
+<p>백오프 정책 예시로 기본 간격을 1초, 2초, 4초처럼 늘리되 최대 30초로 제한하고, 각 간격의 50–100% 범위에서 무작위로 대기 시간을 정할 수 있습니다. 같은 시점에 실패한 이벤트가 함께 몰려 재전송되는 것을 줄이기 위한 jitter입니다. 이벤트마다 Relay 스레드에서 대기하지 않고 다음 발행 시각을 DB에 저장합니다. DB 기록 실패의 재시도와 Kafka 발행 실패의 재시도는 구분합니다.</p>
 <p>행별 백오프만으로 Kafka 전체 장애 중 신규 이벤트의 발행 시도까지 억제되지는 않습니다. 광범위한 연결 실패에는 신규 전송을 잠시 줄이는 정책도 함께 고려합니다. 서킷브레이커를 추가하더라도 차단된 이벤트는 Outbox에 보존하고 복구 후 다시 전달해야 합니다. 오래 기다리는 이벤트와 반복 실패, 결과 기록 적체도 관측합니다.</p>
 </details>
 <details>
 <summary>CDC로 전환하기 전에 현재 병목부터 구분해야 한다</summary>
 <p>CDC를 사용해도 결과와 Outbox를 같은 TX에 저장하는 구조는 유지합니다. 달라지는 것은 발행 경로입니다. Debezium이 MySQL binlog의 Outbox INSERT를 읽으면 주기적 SELECT의 발견 대기를 줄일 수 있지만 Kafka ACK와 Consumer, 주문 DB의 지연까지 사라지지는 않습니다.</p>
-<p>먼저 개선한 것은 폴링의 빈 대기였고, 완료 처리 방식의 비교는 배치 전체 대기로 다음 조회가 막히는 경계를 다룹니다. 이 둘을 해결할 여지가 있는 상황에서 발행 경로 전체를 CDC로 옮기기보다 현재 경로부터 정리했습니다.</p>
+<p>먼저 개선한 것은 폴링 주기로 생기는 대기 시간이었고, 완료 처리 방식의 비교는 배치 전체 대기로 다음 조회가 막히는 경계를 다룹니다. 이 둘을 해결할 여지가 있는 상황에서 발행 경로 전체를 CDC로 옮기기보다 현재 경로부터 정리했습니다.</p>
 <p>표준 Outbox Event Router는 INSERT 중심입니다. 현재 Relay의 <code class="notranslate">next_attempt_at</code> UPDATE를 재발행 지시로 해석하지 않으며 DB의 PUBLISHED도 자동으로 갱신하지 않습니다. 전환 시에는 행별 재시도와 수동 재발행, 발행 상태 조회와 정리 기준을 다시 맞춰야 합니다. <a href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html" rel="nofollow">Outbox Event Router의 동작 계약</a></p>
 <p>또한 CDC는 저장된 binlog 위치나 GTID에서 재개하므로, 중단 중 필요한 로그가 삭제되면 재스냅샷 등 복구가 필요합니다. 커넥터의 중단 허용 시간, binlog 보존과 Outbox 정리 정책을 함께 정해야 합니다. 조회 비용이나 발견 대기가 계속 지배적일 때 다시 비교할 수 있습니다. <a href="https://debezium.io/documentation/reference/stable/connectors/mysql.html" rel="nofollow">MySQL 커넥터의 재시작과 복구</a></p>
 </details>
@@ -557,7 +557,7 @@
 <p>이 조회는 단일 활성 스케줄러 조건입니다. 인덱스는 후보 검색의 <code class="notranslate">(status, next_attempt_at, id)</code>와 선행 검색의 <code class="notranslate">(payment_id, event_sequence)</code> 등을 실제 데이터의 실행 계획으로 확인해야 합니다. PENDING과 BLOCKED는 정리 대상에서 제외합니다.</p>
 </details>
 <h3>선행 결과가 없으면 받은 사실과 적용 완료를 구분한다</h3>
-<p>기존 메시지나 별도 복구 경로로 취소 2가 승인 1보다 먼저 도착할 수 있습니다. 이때 취소를 버리거나 같은 파티션에서 승인 도착까지 붙잡고 있으면 복구가 어려워집니다. 뒤에 있는 승인을 읽지 못할 수도 있기 때문입니다.</p>
+<p>기존 메시지나 별도 복구 경로로 취소 2가 승인 1보다 먼저 도착할 수 있습니다. 이때 취소를 버리면 확정된 결과가 누락됩니다. 현재 레코드의 처리를 완료하지 않은 채 승인을 기다리면, 같은 파티션의 후속 승인 이벤트를 읽지 못할 수 있습니다.</p>
 <markdown-accessiblity-table><table role="table">
 <thead>
 <tr>
